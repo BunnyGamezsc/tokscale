@@ -1,3 +1,4 @@
+// FORK NOTE: module visibility widened for the library target (ADR 0002).
 mod agents;
 mod bar_chart;
 mod daily;
@@ -14,7 +15,7 @@ mod sessions;
 pub mod spinner;
 mod stats;
 mod usage;
-pub(crate) mod widgets;
+pub mod widgets;
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};

@@ -11,6 +11,13 @@ description = "CLI and TUI for tokscale - AI token usage analytics"
 # ambiguous — which `build-native.yml` relies on for the Android smoke step.
 default-run = "tokscale"
 
+# FORK NOTE: upstream ships only the binary. The library target exists so the
+# tokscale-gui Tauri backend can call auth/sync/commands in-process instead of
+# bundling this binary as a sidecar. See ADR 0002 in the tokscale-gui repo.
+[lib]
+name = "tokscale_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tokscale"
 path = "src/main.rs"

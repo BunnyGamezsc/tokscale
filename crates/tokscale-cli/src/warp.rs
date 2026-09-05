@@ -127,7 +127,8 @@ pub fn has_credentials() -> bool {
     load_credentials().is_some()
 }
 
-pub(crate) fn load_usage_cache() -> Option<WarpUsageCache> {
+// FORK NOTE: widened to `pub` for the library target (ADR 0002).
+pub fn load_usage_cache() -> Option<WarpUsageCache> {
     let content = fs::read_to_string(usage_path()).ok()?;
     serde_json::from_str(&content).ok()
 }

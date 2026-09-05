@@ -1,18 +1,20 @@
+// FORK NOTE: module visibility widened for the library target (ADR 0002).
 mod app;
 mod cache;
 pub mod client_ui;
-pub(crate) mod codex_login;
+pub mod codex_login;
 mod colors;
 pub mod config;
 pub mod data;
 mod event;
 mod export;
 mod keymap;
-pub(crate) mod privacy;
+pub mod privacy;
 pub mod remote;
 pub mod settings;
 mod themes;
-pub(crate) mod ui;
+// FORK NOTE: widened to `pub` for the library target (ADR 0002).
+pub mod ui;
 
 pub use app::{App, Tab, TuiConfig};
 pub use cache::{
