@@ -3652,7 +3652,11 @@ fn aggregate_model_usage_entries(
     aggregate_model_usage_entries_with_rollup(messages, group_by, WorktreeRollup::default())
 }
 
-fn aggregate_model_usage_entries_with_rollup(
+/// Aggregates filtered messages into report Entries for a Group-By.
+///
+/// Public for the same reason as [`filter_messages_for_report`]: re-grouping a
+/// held Snapshot is 10-40x cheaper than rescanning.
+pub fn aggregate_model_usage_entries_with_rollup(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
     rollup: WorktreeRollup,
@@ -3805,7 +3809,11 @@ fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
 /// usage entries with saturating_add, so clamped (i64::MAX) entry buckets from a
 /// corrupt source can't overflow the report-level totals (the entries are
 /// already saturated per-field by aggregate_model_usage_entries).
-fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
+/// Sums the token columns of an aggregated report.
+///
+/// Public so an in-process caller can build a `ModelReport` from the two
+/// functions above without duplicating the fold.
+pub fn model_report_token_totals(entries: &[ModelUsage]) -> (i64, i64, i64, i64) {
     entries.iter().fold(
         (0, 0, 0, 0),
         |(input, output, cache_read, cache_write), entry| {
@@ -4707,7 +4715,11 @@ fn message_passes_report_filter(message: &UnifiedMessage, options: &ReportOption
     true
 }
 
-fn filter_messages_for_report(
+/// Applies a Report Filter to a Snapshot of messages.
+///
+/// Public so an in-process caller can parse once and re-filter without
+/// rescanning; `get_model_report` still uses it exactly as before.
+pub fn filter_messages_for_report(
     messages: Vec<UnifiedMessage>,
     options: &ReportOptions,
 ) -> Vec<UnifiedMessage> {
