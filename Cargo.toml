@@ -129,14 +129,6 @@ arboard = "3"
 # Unix signal handling
 signal-hook = "0.3"
 
-# FORK NOTE: not used upstream. Behind tokscale-core's optional `specta`
-# feature, this lets the tokscale-gui Tauri backend generate TypeScript
-# bindings for core's report types. The orphan rule makes deriving
-# `specta::Type` from the GUI crate impossible, so the derives have to live
-# here. Pinned with `=` because specta and tauri-specta pin each other exactly
-# across release candidates. Off by default: an upstream build never sees it.
-specta = { version = "=2.0.0-rc.25", features = ["derive"] }
-
 [profile.release]
 lto = true
 opt-level = 3
