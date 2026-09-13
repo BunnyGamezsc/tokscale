@@ -332,10 +332,16 @@ pub fn clear_cache() {
     }
 }
 
-fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
+fn load_cache_any_age_at(path: &std::path::Path) -> Option<(u64, Vec<UsageOutput>)> {
     let content = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let timestamp = doc.get("timestamp")?.as_u64()?;
+    let data = serde_json::from_value(doc.get("data")?.clone()).ok()?;
+    Some((timestamp, data))
+}
+
+fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
+    let (timestamp, data) = load_cache_any_age_at(path)?;
     let age = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -345,12 +351,20 @@ fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
     if age > 300 {
         return None;
     }
-    serde_json::from_value(doc.get("data")?.clone()).ok()
+    Some(data)
 }
 
 #[cfg_attr(test, allow(dead_code))]
 pub fn load_cache() -> Option<Vec<UsageOutput>> {
     load_cache_at(&cache_path()?)
+}
+
+/// FORK NOTE: the cache with its write time (Unix seconds) and no expiry, so
+/// tokscale-gui can show the last fetch, marked stale, when a new one fails.
+/// See ADR 0007 in the tokscale-gui repo.
+#[cfg_attr(test, allow(dead_code))]
+pub fn load_cache_any_age() -> Option<(u64, Vec<UsageOutput>)> {
+    load_cache_any_age_at(&cache_path()?)
 }
 
 // ── Public API ──
@@ -435,6 +449,16 @@ fn fetch_provider_report(
 }
 
 pub fn fetch_all_report_with_intent(intent: UsageFetchIntent) -> UsageFetchReport {
+    fetch_all_report_and_unconfigured(intent).0
+}
+
+/// FORK NOTE: [`fetch_all_report_with_intent`] plus the providers it skipped for
+/// lack of credentials, from the same `has_credentials` pass. tokscale-gui shows
+/// those as "not set up", and probing again would re-run `security`. See ADR
+/// 0007 in the tokscale-gui repo.
+pub fn fetch_all_report_and_unconfigured(
+    intent: UsageFetchIntent,
+) -> (UsageFetchReport, Vec<&'static str>) {
     let codex_fetch = match intent {
         UsageFetchIntent::CliReadOnly => codex::fetch_all_report,
         UsageFetchIntent::TuiSurface => codex::fetch_all_report_importing_current_auth,
@@ -442,8 +466,11 @@ pub fn fetch_all_report_with_intent(intent: UsageFetchIntent) -> UsageFetchRepor
     fetch_all_report_with_codex(codex_fetch)
 }
 
-fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFetchReport {
+fn fetch_all_report_with_codex(
+    codex_fetch: fn() -> UsageFetchReport,
+) -> (UsageFetchReport, Vec<&'static str>) {
     let mut active: Vec<UsageProvider> = Vec::new();
+    let mut unconfigured = Vec::new();
     // Observability (#947): when a provider is filtered out for lack of
     // credentials, log what was probed so a missing quota card can be traced
     // to credential detection rather than the fetch path.
@@ -451,6 +478,7 @@ fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFe
         if has() {
             active.push((provider, has, fetch));
         } else {
+            unconfigured.push(provider);
             tracing::debug!(
                 provider,
                 probes = ?if provider == "Copilot" {
@@ -464,10 +492,10 @@ fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFe
     }
 
     if active.is_empty() {
-        return UsageFetchReport::default();
+        return (UsageFetchReport::default(), unconfigured);
     }
 
-    std::thread::scope(|scope| {
+    let report = std::thread::scope(|scope| {
         let handles = active
             .into_iter()
             .map(|(provider, _, fetch)| {
@@ -494,7 +522,8 @@ fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFe
             }
         }
         report
-    })
+    });
+    (report, unconfigured)
 }
 
 // ── Light-mode rendering ──

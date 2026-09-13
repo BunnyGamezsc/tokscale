@@ -1,5 +1,5 @@
 use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -143,7 +143,7 @@ async fn fetch_billing_grpc(client: &reqwest::Client, token: &str) -> Result<Vec
 }
 
 fn fetch_agent_billing(timeout: Duration) -> Option<Value> {
-    let mut child = Command::new("grok")
+    let mut child = crate::spawn::command("grok")
         .args(["agent", "--no-leader", "stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

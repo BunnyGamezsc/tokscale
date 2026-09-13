@@ -23,6 +23,7 @@ pub mod device;
 pub mod hindsight;
 pub mod paths;
 pub mod process_liveness;
+pub mod spawn;
 pub mod trae;
 pub mod tui;
 pub mod warp;
