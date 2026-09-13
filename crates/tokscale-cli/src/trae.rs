@@ -327,12 +327,23 @@ pub mod auth {
 
     // ── storage.json decryption ────────────────────────────────────────────
 
-    fn decrypt_from_storage(variant: TraeVariant) -> Result<CachedCredentials> {
+    fn storage_path(variant: TraeVariant) -> Result<PathBuf> {
         let home = crate::paths::home_dir().context("could not determine home directory")?;
-        let app_dir = home
+        Ok(home
             .join("Library/Application Support")
-            .join(variant.app_dir_name());
-        let storage = app_dir.join("User/globalStorage/storage.json");
+            .join(variant.app_dir_name())
+            .join("User/globalStorage/storage.json"))
+    }
+
+    /// FORK NOTE: whether the desktop client has a `storage.json` that
+    /// `resolve_token` could decrypt. No decryption, no network (ADR 0002 in
+    /// tokscale-gui).
+    pub fn has_desktop_login(variant: TraeVariant) -> bool {
+        storage_path(variant).is_ok_and(|p| p.exists())
+    }
+
+    fn decrypt_from_storage(variant: TraeVariant) -> Result<CachedCredentials> {
+        let storage = storage_path(variant)?;
 
         if !storage.exists() {
             return Err(anyhow::anyhow!(
@@ -1381,43 +1392,56 @@ pub mod sync {
         since_days: i64,
         include_aux: bool,
     ) -> Result<()> {
-        let usage_types: Vec<i32> = if include_aux {
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
-        } else {
-            vec![5, 6]
-        };
-
         let credentialed: Vec<TraeVariant> = variants
             .iter()
             .copied()
             .filter(|v| auth::has_credentials(*v))
             .collect();
 
-        if credentialed.is_empty() {
-            if variants.is_empty() {
-                println!("  No Trae credentials found. Run `tokscale trae login` first.");
-            } else {
-                for variant in variants {
-                    println!(
-                        "  Trae {}: no credentials — run `tokscale trae login --variant {}` first",
-                        variant.client_str(),
-                        variant.cli_arg()
-                    );
-                }
+        match sync_trae(&credentialed, since_days, include_aux).await? {
+            Some((variant, n)) => {
+                println!(
+                    "  Trae: synced {n} sessions (using {} credentials)",
+                    variant.client_str()
+                );
+                Ok(())
             }
-            return Ok(());
-        }
-
-        let mut last_err: Option<anyhow::Error> = None;
-        for variant in &credentialed {
-            match sync_variant(*variant, since_days, &usage_types).await {
-                Ok(n) => {
-                    println!(
-                        "  Trae: synced {n} sessions (using {} credentials)",
-                        variant.client_str()
-                    );
-                    return Ok(());
+            None => {
+                if variants.is_empty() {
+                    println!("  No Trae credentials found. Run `tokscale trae login` first.");
+                } else {
+                    for variant in variants {
+                        println!(
+                            "  Trae {}: no credentials — run `tokscale trae login --variant {}` first",
+                            variant.client_str(),
+                            variant.cli_arg()
+                        );
+                    }
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// FORK NOTE: the variant fall-over from `run_trae_sync`, returning the
+    /// variant that succeeded and its session count instead of printing it.
+    /// `None` when `variants` is empty. Unlike `run_trae_sync` it doesn't filter
+    /// by `has_credentials`, so a caller may pass a variant that only has a
+    /// desktop login (ADR 0002 in tokscale-gui).
+    pub async fn sync_trae(
+        variants: &[TraeVariant],
+        since_days: i64,
+        include_aux: bool,
+    ) -> Result<Option<(TraeVariant, usize)>> {
+        let usage_types: Vec<i32> = if include_aux {
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        } else {
+            vec![5, 6]
+        };
+        let mut last_err: Option<anyhow::Error> = None;
+        for variant in variants {
+            match sync_variant(*variant, since_days, &usage_types).await {
+                Ok(n) => return Ok(Some((*variant, n))),
                 Err(e) => {
                     eprintln!(
                         "  Trae sync failed using {} credentials: {e}",
@@ -1433,7 +1457,7 @@ pub mod sync {
         // success after the per-variant `eprintln!` lines scroll off.
         match last_err {
             Some(e) => Err(e.context("all Trae credential sources failed")),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 

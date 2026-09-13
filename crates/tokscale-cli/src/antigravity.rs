@@ -204,9 +204,63 @@ struct SessionCandidate {
     artifact_path: Option<String>,
 }
 
+/// What one sync saw and left in the cache.
+///
+/// FORK NOTE: `run_antigravity_sync` only printed these. The sync itself is
+/// unchanged; it returns them so tokscale-gui can show a result (ADR 0002).
+#[derive(Debug, Clone)]
+pub struct AntigravitySync {
+    pub cache_dir: PathBuf,
+    pub known_sessions: usize,
+    pub detected_connections: usize,
+    pub detected_sessions: usize,
+    pub filesystem_candidates: usize,
+    pub export_candidates: usize,
+    pub cached_sessions: usize,
+}
+
 pub fn run_antigravity_sync() -> Result<()> {
     use colored::Colorize;
 
+    let s = sync_antigravity_cache()?;
+    println!("\n  {}", "Antigravity sync".cyan());
+    println!(
+        "  {}",
+        "Synced local Antigravity cache from running language servers.".bright_black()
+    );
+    println!(
+        "  {}",
+        format!("cache: {}", s.cache_dir.display()).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("known sessions: {}", s.known_sessions).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("detected connections: {}", s.detected_connections).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("detected sessions: {}", s.detected_sessions).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("filesystem candidates: {}", s.filesystem_candidates).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("export candidates: {}", s.export_candidates).bright_black()
+    );
+    println!(
+        "  {}",
+        format!("cached sessions after sync: {}", s.cached_sessions).bright_black()
+    );
+    println!();
+    Ok(())
+}
+
+pub fn sync_antigravity_cache() -> Result<AntigravitySync> {
     let cache_dir = get_antigravity_cache_dir()?;
     let sessions_dir = get_antigravity_sessions_dir()?;
     ensure_config_dir()?;
@@ -285,45 +339,15 @@ pub fn run_antigravity_sync() -> Result<()> {
     save_antigravity_manifest(&next_manifest)?;
     cleanup_stale_session_artifacts(&manifest, &next_manifest)?;
 
-    println!("\n  {}", "Antigravity sync".cyan());
-    println!(
-        "  {}",
-        "Synced local Antigravity cache from running language servers.".bright_black()
-    );
-    println!(
-        "  {}",
-        format!("cache: {}", cache_dir.display()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!("known sessions: {}", manifest.sessions.len()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!("detected connections: {}", connections.len()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!("detected sessions: {}", summaries.len()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!("filesystem candidates: {}", filesystem_candidates.len()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!("export candidates: {}", export_candidates.len()).bright_black()
-    );
-    println!(
-        "  {}",
-        format!(
-            "cached sessions after sync: {}",
-            next_manifest.sessions.len()
-        )
-        .bright_black()
-    );
-    println!();
-    Ok(())
+    Ok(AntigravitySync {
+        cache_dir,
+        known_sessions: manifest.sessions.len(),
+        detected_connections: connections.len(),
+        detected_sessions: summaries.len(),
+        filesystem_candidates: filesystem_candidates.len(),
+        export_candidates: export_candidates.len(),
+        cached_sessions: next_manifest.sessions.len(),
+    })
 }
 
 pub fn run_antigravity_status(json: bool) -> Result<()> {
