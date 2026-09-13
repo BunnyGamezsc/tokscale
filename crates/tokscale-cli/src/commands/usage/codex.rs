@@ -298,7 +298,8 @@ fn has_codex_error(error: &anyhow::Error, predicate: impl Fn(&CodexUsageError) -
     })
 }
 
-fn is_missing_credentials(error: &anyhow::Error) -> bool {
+/// FORK NOTE: public so an embedder can tell "not signed in" from a failure.
+pub fn is_missing_credentials(error: &anyhow::Error) -> bool {
     has_codex_error(error, |error| {
         matches!(error, CodexUsageError::MissingCredentials)
     })

@@ -3,7 +3,7 @@ use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -127,7 +127,8 @@ struct AppServerTransport {
 
 impl AppServerTransport {
     fn spawn() -> std::result::Result<Self, ActivityFetchError> {
-        let mut child = Command::new("codex")
+        // FORK NOTE: through the embedder's resolver (spawn.rs), not a bare name.
+        let mut child = crate::spawn::command("codex")
             .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -229,16 +230,24 @@ impl AppServerTransport {
 
 impl Drop for AppServerTransport {
     fn drop(&mut self) {
-        // Drop the receiver before joining stdout so a blocked bounded sender can exit.
+        // Drop the receiver so a blocked bounded sender can exit.
         self.frames.take();
+        // FORK NOTE: npm's `codex` is a node wrapper that hands the native binary
+        // our pipes (`stdio: "inherit"`) and forwards SIGTERM but can't forward
+        // SIGKILL. Killing only the wrapper orphaned the app-server with the
+        // pipes open, and joining the readers then blocked forever. TERM first,
+        // and let the readers finish on EOF rather than joining them.
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status();
+            thread::sleep(Duration::from_millis(200));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
-        }
+        self.stdout_reader.take();
+        self.stderr_reader.take();
     }
 }
 
@@ -467,11 +476,14 @@ fn parse_activity_result(
     })
 }
 
+/// FORK NOTE: the body of `run`, returning the snapshot it prints. Activity is
+/// the codex CLI's current login, since that is what `codex app-server` reads.
+pub fn fetch() -> CodexAccountActivitySnapshot {
+    fetch_activity_from_app_server().unwrap_or_else(ActivityFetchError::snapshot)
+}
+
 pub fn run(json: bool) -> Result<()> {
-    let activity = match fetch_activity_from_app_server() {
-        Ok(activity) => activity,
-        Err(error) => error.snapshot(),
-    };
+    let activity = fetch();
 
     if json {
         println!(
