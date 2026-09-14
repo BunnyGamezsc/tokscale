@@ -244,6 +244,15 @@ impl Drop for AppServerTransport {
                 .status();
             thread::sleep(Duration::from_millis(200));
         }
+        // FORK NOTE: `codex.cmd` -> node -> codex.exe; kill() only reaches cmd.exe.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &self.child.id().to_string()])
+                .creation_flags(0x0800_0000)
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.stdout_reader.take();

@@ -30,6 +30,12 @@ pub fn command(name: &str) -> Command {
     if let Some(path) = path_with_dir_of(&program, std::env::var_os("PATH")) {
         command.env("PATH", path);
     }
+    // FORK NOTE: a GUI-subsystem parent would otherwise open a console window per spawn.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     command
 }
 
