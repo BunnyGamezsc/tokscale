@@ -21,10 +21,8 @@ use std::time::UNIX_EPOCH;
 // revalidated without reparsing the sidechain on every warm scan, while a
 // later-created parent transcript still invalidates the entry.
 // 3: UnifiedMessage gained session_title, changing the bincode payload layout.
-// Old shards must read as Stale (silent rebuild), not Invalid (corruption
-// warning), so the format version moves with the struct.
 // 4: UnifiedMessage gained model_attribution_conflicted, changing the bincode
-// payload layout. Old shards must be silently rebuilt rather than decoded.
+// payload layout.
 // 5: Prime Agent entries cache reconciliation accounting beside their messages.
 // Version-4 shards have an explicit wire migration below, so other clients stay
 // warm and Prime entries need only one rebuild/backfill.
@@ -35,10 +33,33 @@ use std::time::UNIX_EPOCH;
 // 7: OpenCode incremental marks record row provenance. Version-6 shards have a
 // wire migration below: unrelated clients retain their cache, while OpenCode
 // keeps its parsed messages and takes one full scan to acquire the new map.
-const CACHE_FORMAT_VERSION: u32 = 7;
+// 8: UnifiedMessage gained service_tier, changing the bincode payload layout.
+// Versions 4-7 have wire migrations below so cached messages, including
+// Claude's compacted history, survive the layout change. MiMo v8 has its own
+// envelope and migrates with its row provenance intact.
+// 9: TokenBreakdown gained cache_write_1h, changing the bincode payload
+// layout. Version-8 shards have a wire migration below so cached messages,
+// including Claude's compacted history, survive the layout change. MiMo v9
+// has its own envelope and migrates with its row provenance intact.
+// 10: UnifiedMessage gained parent_session_id, changing the bincode payload
+// layout. bincode is positional, so versions 4 through 9 carry their own
+// message type and migrate with the field empty. Only the Pi-format driver
+// populates it, and every client that driver serves reads Stale through the
+// parser version, so those entries re-parse rather than migrate.
+const CACHE_FORMAT_VERSION: u32 = 10;
+// MiMo stores exact per-row provenance beside each cached entry. Its envelope
+// version moves too because those entries also serialize UnifiedMessage, so
+// it stays one ahead of CACHE_FORMAT_VERSION as both move together.
+const MICODE_CACHE_FORMAT_VERSION: u32 = 11;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
+const LEGACY_CACHE_FORMAT_VERSION_V7: u32 = 7;
+const LEGACY_CACHE_FORMAT_VERSION_V8: u32 = 8;
+const LEGACY_CACHE_FORMAT_VERSION_V9: u32 = 9;
+const LEGACY_MICODE_CACHE_FORMAT_VERSION_V10: u32 = 10;
+const LEGACY_MICODE_CACHE_FORMAT_VERSION_V9: u32 = 9;
+const LEGACY_MICODE_CACHE_FORMAT_VERSION_V8: u32 = 8;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -1064,8 +1085,227 @@ pub fn parser_generation() -> u64 {
     acc
 }
 
+/// A family of clients whose caches must invalidate together because they
+/// read the same source format through one shared parser driver, plus the
+/// driver base version every member derives from.
+///
+/// This roster is the single source of truth for cache-relevant parser
+/// sharing: `parser_version()` reads each member's version from its
+/// family's base through [`shared_family_version`], so a client cannot
+/// join a family without its version moving with the base, cannot be
+/// re-versioned independently while it is rostered, and cannot be dropped
+/// from the roster without `parser_version()` failing loudly on the
+/// client's next lookup. The tests pin the exact membership and offsets,
+/// so any edit here is a deliberate, reviewed change.
+struct SharedParserFamily {
+    /// Short format-driver name, used in assertion messages.
+    name: &'static str,
+    /// The driver module's base parser version. A parse change in the
+    /// shared driver bumps this constant and moves every member at once.
+    base: u32,
+    /// `(client, offset)` pairs. The client's cache version is
+    /// `base + offset`; the offset preserves the client's independent
+    /// invalidation history so joining a family never renumbers live
+    /// caches.
+    members: &'static [(ClientId, u32)],
+}
+
+/// Clients that delegate to the *same parser code* rather than owning an
+/// independent parser. Cross-cutting leaf helpers (`sessions/utils.rs`,
+/// `pi::has_replacement_character`) are used by many otherwise-unrelated
+/// parsers; a behavioral change to one of those must bump each affected
+/// client individually and is deliberately not modeled as a family.
+///
+/// Residual risk this roster does not close: a *new* client that delegates
+/// to an existing shared driver but is given an independent literal arm in
+/// `parser_version()` and left out of this roster is not detected here. The
+/// exhaustive match and the `ClientId::ALL` bisection only enforce that
+/// every client is classified, not that a shared delegate is rostered, and
+/// tying the two together would require routing and versioning to consume
+/// one descriptor. When adding a client that reuses an existing parser,
+/// roster it in the matching family; that pairing is a code-review
+/// responsibility.
+const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
+    SharedParserFamily {
+        // Antigravity CLI and IDE extension conversation databases use the
+        // same gen_metadata parser in `sessions/antigravity_cli.rs`.
+        name: "antigravity generation database",
+        base: crate::sessions::antigravity_cli::ANTIGRAVITY_DB_PARSER_BASE_VERSION,
+        members: &[
+            (ClientId::AntigravityCli, 0),
+            (ClientId::AntigravityExtension, 0),
+        ],
+    },
+    SharedParserFamily {
+        // Pi, Kimchi, Omp, and Senpi delegate to the pi-format parser in
+        // `sessions/pi.rs`; Prime Agent rides on it through
+        // `parse_pi_format_rlm_file_with_observer` (#1195, #1288).
+        name: "pi-format",
+        base: crate::sessions::pi::PI_FORMAT_PARSER_BASE_VERSION,
+        members: &[
+            // +1: Pi subagent sessions now derive agent attribution from
+            // session_info names; version-1 caches carry those messages
+            // without agent metadata.
+            (ClientId::Pi, 2),
+            // +1: Kimchi's Pi-compatible messages now carry stable
+            // namespaced deduplication keys.
+            (ClientId::Kimchi, 1),
+            // +1: Standard Pi/OMP/Senpi parser now emits cross-session
+            // namespaced dedup keys (same behavior as Kimchi/Prime).
+            (ClientId::Omp, 1),
+            (ClientId::Senpi, 1),
+            // +3 for Prime Agent's independent history. v1->v2 strips a
+            // leading BOM and recovers records containing undecodable
+            // bytes; its accounting scan also continues past those records
+            // instead of truncating and misaligning message indices. The
+            // bump intentionally forces a full re-decode and
+            // accounting/matching rebuild; it makes the legacy v4
+            // accounting-backfill path unreachable for live caches, but
+            // avoids mixing v1 cached messages with v2 scans. Without the
+            // bump, malformed-line loss could be mistaken for complete
+            // accounting rather than a truncated source. v2->v3 rejects
+            // damaged lineage and usage structural keys before
+            // reconciliation bookkeeping. v3->v4 rejects damaged lineage
+            // values and matching-critical child timestamps while
+            // preserving unrelated damaged usage extensions. v4->v5: the
+            // cached accounting layout gained the 1-hour cache-write bucket.
+            (ClientId::PrimeAgent, 4),
+        ],
+    },
+    SharedParserFamily {
+        // Roo Code, Kilo Code, and Cline forked one task-log format and
+        // all parse it through `roocode::parse_roo_kilo_file`. Roo Code
+        // and Kilo Code parse task logs *only* through that helper and
+        // carry no independent invalidation history.
+        name: "roo/kilo task log",
+        base: crate::sessions::roocode::ROO_KILO_TASK_LOG_PARSER_BASE_VERSION,
+        members: &[
+            (ClientId::RooCode, 0),
+            (ClientId::KiloCode, 0),
+            // +2 for Cline's independent history. v1->v2: standalone Cline
+            // messages subtract cache buckets from gross input tokens,
+            // reject non-finite costs, and preserve zero-cost reports.
+            // v2->v3: content-aware Cline CLI turn-start classification
+            // now recognizes user tool-result records as continuations
+            // instead of beginning a new turn, so cached turns must be
+            // reparsed.
+            (ClientId::Cline, 2),
+        ],
+    },
+    SharedParserFamily {
+        // OpenCode, MiMo Code, and Kilo read their SQLite stores through
+        // the shared `opencode_schema` driver (Kilo with Kilo-specific
+        // policy in `OpenCodeSchemaConfig::kilo`).
+        name: "opencode schema",
+        base: crate::sessions::opencode_schema::OPENCODE_SCHEMA_PARSER_BASE_VERSION,
+        members: &[
+            // +2 for OpenCode's independent history. v1 -> v2: the parser
+            // now prefers `session_v2` metadata over the legacy `session`
+            // join for workspace and title; a database that carries both
+            // tables is byte-identical before and after, so only the bump
+            // discards entries still holding the old attribution.
+            // v2 -> v3: id-less legacy JSON messages now carry a canonical
+            // path-scoped key instead of a globally colliding filename
+            // stem; the source bytes and fingerprint do not change, so
+            // invalidate cached v2 rows to make same-named files in
+            // different sessions survive (#1198).
+            (ClientId::OpenCode, 2),
+            // +2 for MiMo Code's independent history. v1 retained MiMo's
+            // embedded `cost` value but did not preserve its
+            // provider-reported provenance; reparse cached rows so strict
+            // submit validation does not reject valid unknown-model MiMo
+            // usage offline. v2->v3: duplicate merging now upgrades the
+            // retained row when a later copy carries an explicit cost,
+            // including zero. v3->v4: Xiaomi MiMo AI desktop sessions share
+            // the same mimocode SQLite store and are re-stamped as
+            // `micode-desktop` when `session.version` starts with `desktop-`;
+            // warm v3 entries still label every row `micode`.
+            // Desktop and CLI parse through the same `parse_micode_sqlite`
+            // entrypoint and therefore share MiMo Code's invalidation history.
+            // v5->v6: deduplicate forked history across desktop/CLI surfaces
+            // while retaining the original call's surface attribution.
+            (ClientId::MiMoCode, 5),
+            (ClientId::MiMoDesktop, 5),
+            (ClientId::Kilo, 0),
+        ],
+    },
+    SharedParserFamily {
+        // CodeBuddy and WorkBuddy parse their detailed JSONL transcripts
+        // and extension logs through the shared `tencent_buddy` module.
+        // Neither carries independent invalidation history. (WorkBuddy's
+        // aggregate-DB fallback lives in `workbuddy.rs` itself; a change
+        // scoped to it belongs in a WorkBuddy offset, not the base.)
+        name: "tencent buddy",
+        base: crate::sessions::tencent_buddy::TENCENT_BUDDY_PARSER_BASE_VERSION,
+        members: &[(ClientId::CodeBuddy, 0), (ClientId::WorkBuddy, 0)],
+    },
+    SharedParserFamily {
+        // Codebuff and Freebuff read the same `chat-messages.json` shape;
+        // Freebuff extracts usage through `codebuff.rs` helpers. Neither
+        // carries independent invalidation history.
+        name: "codebuff chat",
+        base: crate::sessions::codebuff::CODEBUFF_CHAT_PARSER_BASE_VERSION,
+        members: &[(ClientId::Codebuff, 0), (ClientId::Freebuff, 0)],
+    },
+];
+
+/// Versions a shared-family member as its family's driver base plus the
+/// member's declared offset. Returns `None` for clients that own an
+/// independent parser and are versioned by an explicit `parser_version()`
+/// arm.
+fn shared_family_version(client: ClientId) -> Option<u32> {
+    let mut matches = SHARED_PARSER_FAMILIES.iter().filter_map(|family| {
+        family
+            .members
+            .iter()
+            .find(|entry| entry.0 == client)
+            .map(|entry| (family.name, family.base + entry.1))
+    });
+    let first = matches.next();
+    debug_assert!(
+        matches.next().is_none(),
+        "{client:?} is declared in two shared-parser families"
+    );
+    first.map(|(_, version)| version)
+}
+
 fn parser_version(client: ClientId) -> u32 {
+    // Shared-family members are versioned by the roster alone: their
+    // version is their family's base plus their declared offset, so a
+    // driver change that bumps the base moves the whole family at once.
+    if let Some(version) = shared_family_version(client) {
+        return version;
+    }
     match client {
+        // v1->v2 (#1285): compressed OpenClaw archives were scanned as plain
+        // JSONL and cached as empty. Their bytes do not change when decoding is
+        // fixed, so only the parser version can retire those entries.
+        // v2->v3 (#1278): OpenClaw messages now carry a stable dedup key built
+        // from the event (`openclaw:<event id>:<timestamp>:<input>:<output>`,
+        // or `openclaw:codex-mirror:<thread>:<turn>:…` for a row that mirrors a
+        // Codex app-server turn) that lets a transcript migrated into the
+        // per-agent SQLite store collapse against its retained legacy JSONL
+        // copy, and lets the lane match a mirror row to the rollout's record of
+        // its turn. Entries below v3 have no key, so a warm JSONL entry would
+        // count beside the SQLite rows for the same events. `reasoningTokens`
+        // is also split out of `output` now.
+        // v3->v4 (#1293): compaction checkpoint snapshots are no longer scan
+        // sources. Source-cache entries cannot be reached once discovery omits
+        // them, but parser_generation must change so the source-agnostic TUI
+        // aggregate cache cannot replay totals that included those snapshots.
+        // v4->v5 (#1299): legacy JSONL `openclaw doctor` archived unreferenced
+        // (`session-sqlite-import-archive/archive-tier.<session id>.jsonl…`)
+        // now reports the session id behind the archive key instead of the
+        // archived spelling. The doctor never writes to those files again, so
+        // their fingerprints stay valid and a warm v4 entry would keep serving
+        // `archive-tier.<id>` sessions without the parser ever running.
+        // v5->v6 (#1298): legacy per-agent `cli-auth/codex/<profile>` homes
+        // are Codex rollouts OpenClaw owns, rather than OpenClaw transcripts.
+        // Their bytes are unchanged, so v5's cached empty transcript result
+        // must not survive the new path classification.
+        // v6->v7: SQLite rows with NULL event_json hold zstd payloads. Older
+        // scans cached only the plain rows, even when the store never changed.
+        ClientId::OpenClaw => 7,
         // These clients accumulated parser-only invalidations under the old
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
@@ -1074,7 +1314,28 @@ fn parser_version(client: ClientId) -> u32 {
         // carried in both. Without this bump an existing cache keeps replaying
         // pre-split rows, and those sessions stay double-priced while looking
         // fixed.
-        ClientId::Codex => 7,
+        // v7->v8: rollouts whose `session_meta.originator` is OpenClaw now
+        // leave the parser tagged `client = "openclaw"` and keyed by the Codex
+        // thread id, so the openclaw lane can own them. A v7 entry for such a
+        // file holds them tagged `codex` and would keep counting them there,
+        // beside OpenClaw's own rows. The cached parse state also records
+        // which turns the rollout emitted usage for (`turn_coverage`), which
+        // the openclaw lane matches OpenClaw's per-turn mirror rows against;
+        // an entry without it would let a mirror row count beside the
+        // rollout's own record of the same turn.
+        // v8->v9: agent attribution no longer carries the per-thread random
+        // `agent_nickname`; messages bucket into "Codex" / "Codex Subagent" /
+        // "Codex Guardian" / "Codex Headless", and the cached parse state gained
+        // `session_is_subagent` and `session_is_guardian`. A v8 entry would keep
+        // replaying one Agents row per nickname (or no agent at all), and its
+        // parse state predates the new layout.
+        // v9->v10 (#1361, pre-allocated in the cross-PR union): Codex retains
+        // the actual service tier on each usage row and applies OpenAI's Fast
+        // mode pricing premium. The number was reserved ahead of that change
+        // so it could land without another bump.
+        // v10->v11: standalone `task_started` events reset duration anchors so
+        // resumed turns cannot inherit the idle gap from a previous turn.
+        ClientId::Codex => 11,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -1096,14 +1357,12 @@ fn parser_version(client: ClientId) -> u32 {
         // when reconstructing VS Code Copilot Chat requests; v8 aggregates
         // carry those sessions as zero-token.
         ClientId::Copilot => 9,
-        // Pi subagent sessions now derive agent attribution from session_info
-        // names; version-1 caches carry those messages without agent metadata.
-        ClientId::Pi => 2,
         // Devin CLI v1 could stop at a malformed chat_message. v2->v3:
         // message timestamp is now back-calculated to the turn start
         // (created_at - total_time_ms) instead of the recorded (end-anchored)
-        // created_at. Follow-up to #890.
-        ClientId::DevinCli => 3,
+        // created_at. Follow-up to #890. v3->v4 deduplicates CLI copies by
+        // request_id instead of database row id.
+        ClientId::DevinCli => 4,
         // Desktop v1 parsed a non-ACP shape and did not track its CLI title
         // lookup; its timestamp handling is unaffected by the #890 follow-up.
         ClientId::DevinDesktop => 2,
@@ -1157,13 +1416,14 @@ fn parser_version(client: ClientId) -> u32 {
         // v3->v4: non-positive wire timestamps (kimi-cli `timestamp`,
         // kimi-code `time`) now fall back to the file mtime instead of
         // anchoring the message in a pre-epoch bucket.
-        ClientId::Kimi => 4,
-        // v1->v2: standalone Cline messages subtract cache buckets from gross
-        // input tokens, reject non-finite costs, and preserve zero-cost reports.
-        // v2->v3: content-aware Cline CLI turn-start classification now
-        // recognizes user tool-result records as continuations instead of
-        // beginning a new turn, so cached turns must be reparsed.
-        ClientId::Cline => 3,
+        // Workspace indexes are applied after the cache read and do not
+        // change the persisted parser output.
+        // v4->v5: kimi-code messages now carry `duration_ms` derived from the
+        // preceding llm.request timestamp and, when paired, are anchored at that
+        // request's start. Untouched wire files keep valid fingerprints, so a
+        // warm v4 entry would keep replaying rows with no duration sample and
+        // the ms/1K column would stay empty for them.
+        ClientId::Kimi => 5,
         // v1->v2: cache-write now maps directly from `Input (w/ Cache Write)`
         // instead of subtracting `Input (w/o Cache Write)`, and a numeric CSV
         // `Cost` (including explicit zero) is retained as provider-reported so
@@ -1174,21 +1434,6 @@ fn parser_version(client: ClientId) -> u32 {
         // of landing unpriced, and uses a UTC-stable synthetic id for the id-less
         // fallback.
         ClientId::Cursor => 3,
-        // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
-        // deduplication keys.
-        ClientId::Kimchi => 2,
-        // v1->v2: Prime Agent now strips a leading BOM and recovers records
-        // containing undecodable bytes; its accounting scan also continues past
-        // those records instead of truncating and misaligning message indices.
-        // The bump intentionally forces a full re-decode and accounting/matching
-        // rebuild; it makes the legacy v4 accounting-backfill path unreachable
-        // for live caches, but avoids mixing v1 cached messages with v2 scans.
-        // Without the bump, malformed-line loss could be mistaken for complete
-        // accounting rather than a truncated source. v2->v3 rejects damaged
-        // lineage and usage structural keys before reconciliation bookkeeping.
-        // v3->v4 rejects damaged lineage values and matching-critical child
-        // timestamps while preserving unrelated damaged usage extensions.
-        ClientId::PrimeAgent => 4,
         // Initial Reasonix implementation. The fingerprint samples the
         // append-only stats JSONL source so appended records are reparsed.
         // v1->v2: strip a leading BOM and recover records containing
@@ -1219,12 +1464,6 @@ fn parser_version(client: ClientId) -> u32 {
         // file position. Both change the parse of byte-identical input, so
         // cached entries hold truncated and under-deduplicated output (#1031).
         ClientId::Grok => 7,
-        // v1 retained MiMo's embedded `cost` value but did not preserve its
-        // provider-reported provenance. Reparse cached rows so strict submit
-        // validation does not reject valid unknown-model MiMo usage offline.
-        // v2->v3: duplicate merging now upgrades the retained row when a later
-        // copy carries an explicit cost, including zero.
-        ClientId::MiMoCode => 3,
         // Droid's cumulative session totals now anchor on the settings file's
         // mtime (floored at providerLockTimestamp) instead of the lock
         // timestamp alone, so a long-running session stops reporting every
@@ -1272,7 +1511,14 @@ fn parser_version(client: ClientId) -> u32 {
         // `data.compactionId` before the per-transcript `seq` fallback. Reparse
         // released v4 rows so unrelated summaries with otherwise identical
         // call data are no longer collapsed across files (#1187).
-        ClientId::Dsh => 5,
+        // v5->v6: current DSH assistant settlements can keep usage only in
+        // their embedded stream, and failed attempts are durable
+        // `assistant/attempt` events. Reparse old rows so those provider calls
+        // are included in usage and cost totals (#1348).
+        // v6->v7: attempt sequence numbers restart in each transcript, so
+        // fallback attempt keys now include the session id to avoid merging
+        // unrelated sessions in the shared parse lane.
+        ClientId::Dsh => 7,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -1282,21 +1528,69 @@ fn parser_version(client: ClientId) -> u32 {
         // byte-identical before and after, so only this bump discards the v1
         // rows still holding a provider-reported zero.
         ClientId::Fx => 2,
-        // omp delegates to the shared pi-format parser, so any pi.rs parse
-        // change that bumps ClientId::Pi must be evaluated for Omp (and Senpi)
-        // too — the shared code path changes what byte-identical omp files
-        // parse to even though omp's own module did not change.
-        ClientId::Omp => 1,
-        // v1 -> v2: the OpenCode parser now prefers `session_v2` metadata over
-        // the legacy `session` join for workspace and title. A database that
-        // carries both tables is byte-identical before and after, so only the
-        // version bump discards entries still holding the old attribution.
-        // v2 -> v3: id-less legacy JSON messages now carry a canonical
-        // path-scoped key instead of a globally colliding filename stem. The
-        // source bytes and fingerprint do not change, so invalidate cached v2
-        // rows to make same-named files in different sessions survive (#1198).
-        ClientId::OpenCode => 3,
-        _ => 1,
+        // The remaining clients parse their own formats and have never
+        // shipped a parser-only change that leaves byte-identical input
+        // parsing differently, so all of them are at version 1. Repeating
+        // values across independent parsers is harmless -- every cache
+        // identity is namespaced by `client.as_str()` first, so one client's
+        // bump can never invalidate or collide with another's entries
+        // (`CacheIdentity` / `CachedSourceEntry::matches_identity`). Sharing
+        // is reserved for parsers that are the *same code*: those clients
+        // are versioned by `SHARED_PARSER_FAMILIES` above, never listed
+        // here. No `_ => 1` arm on purpose: adding a client to
+        // `define_clients!` fails compilation here until the client is
+        // either added to a shared family (its version then derives from
+        // the family's driver base) or given an explicit independent arm.
+        ClientId::Gemini => 1,
+        ClientId::Amp => 1,
+        ClientId::Qwen => 1,
+        ClientId::Mux => 1,
+        ClientId::Crush => 1,
+        ClientId::Goose => 1,
+        ClientId::Antigravity => 1,
+        ClientId::Zed => 1,
+        ClientId::Trae => 1,
+        ClientId::Warp => 1,
+        ClientId::Gjc => 1,
+        ClientId::CommandCode => 1,
+        // v1->v2: reads the 1-hour cache-write bucket into `cache_write_1h`.
+        ClientId::Augment => 2,
+        // v1->v2: reads the 1-hour cache-write bucket into `cache_write_1h`.
+        ClientId::CherryStudio => 2,
+        ClientId::Mcode => 1,
+        ClientId::LmStudio => 1,
+        // v1->v2: split cache-inclusive Hindsight input before pricing. Unchanged
+        // monthly ledgers must not replay the old double-counted buckets.
+        ClientId::Hindsight => 2,
+        // v2 preserves actual provider identity; v3 clears stale provider
+        // metadata when a persisted reset/sentinel snapshot removes it.
+        ClientId::Muse => 3,
+        // Shared-family members are versioned by `SHARED_PARSER_FAMILIES`
+        // through the roster lookup at the top of this function. Listing
+        // them here keeps the match exhaustive at compile time; reaching
+        // this arm means a member was dropped from the roster without
+        // reclassifying the client, which must fail loudly rather than
+        // silently fall back to anything.
+        ClientId::Pi
+        | ClientId::Kimchi
+        | ClientId::Omp
+        | ClientId::Senpi
+        | ClientId::PrimeAgent
+        | ClientId::RooCode
+        | ClientId::KiloCode
+        | ClientId::Cline
+        | ClientId::OpenCode
+        | ClientId::MiMoCode
+        | ClientId::AntigravityCli
+        | ClientId::AntigravityExtension
+        | ClientId::MiMoDesktop
+        | ClientId::Kilo
+        | ClientId::CodeBuddy
+        | ClientId::WorkBuddy
+        | ClientId::Codebuff
+        | ClientId::Freebuff => unreachable!(
+            "{client:?} is a shared-parser family member missing from SHARED_PARSER_FAMILIES"
+        ),
     }
 }
 
@@ -1387,6 +1681,441 @@ pub(crate) struct CachedSourceEntry {
     /// other than the message list it was taken with would skip rows and
     /// under-report.
     pub opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+    /// MiMo-only parallel row provenance. This is NOT another v7 positional
+    /// field: the namespace-specific envelope serializes it beside that entry.
+    #[serde(skip)]
+    pub micode_metadata: Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+}
+
+/// TokenBreakdown wire layout used by cache formats 4 through 8, before
+/// `cache_write_1h` was added. Every legacy message type below embeds this
+/// rather than the live `TokenBreakdown`, so a future field on the live type
+/// cannot silently misalign these frozen payloads again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyTokenBreakdownV8 {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
+}
+
+impl From<LegacyTokenBreakdownV8> for crate::TokenBreakdown {
+    fn from(tokens: LegacyTokenBreakdownV8) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output,
+            cache_read: tokens.cache_read,
+            cache_write: tokens.cache_write,
+            cache_write_1h: 0,
+            reasoning: tokens.reasoning,
+        }
+    }
+}
+
+impl From<crate::TokenBreakdown> for LegacyTokenBreakdownV8 {
+    fn from(tokens: crate::TokenBreakdown) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output,
+            cache_read: tokens.cache_read,
+            cache_write: tokens.cache_write,
+            reasoning: tokens.reasoning,
+        }
+    }
+}
+
+/// TokenBreakdown wire layout used by cache format 9, before
+/// `parent_session_id` was added. The live `TokenBreakdown` is frozen here so
+/// a future field on it cannot silently misalign version-9 shards the way the
+/// live type once did for the versions above.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyTokenBreakdownV9 {
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cache_write_1h: i64,
+    reasoning: i64,
+}
+
+impl From<LegacyTokenBreakdownV9> for crate::TokenBreakdown {
+    fn from(tokens: LegacyTokenBreakdownV9) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output,
+            cache_read: tokens.cache_read,
+            cache_write: tokens.cache_write,
+            cache_write_1h: tokens.cache_write_1h,
+            reasoning: tokens.reasoning,
+        }
+    }
+}
+
+impl From<crate::TokenBreakdown> for LegacyTokenBreakdownV9 {
+    fn from(tokens: crate::TokenBreakdown) -> Self {
+        Self {
+            input: tokens.input,
+            output: tokens.output,
+            cache_read: tokens.cache_read,
+            cache_write: tokens.cache_write,
+            cache_write_1h: tokens.cache_write_1h,
+            reasoning: tokens.reasoning,
+        }
+    }
+}
+
+/// UnifiedMessage wire layout used by cache formats 4 through 7, before
+/// `service_tier` was added. Bincode encodes struct fields positionally, so
+/// decoding these payloads directly as the current UnifiedMessage would shift
+/// every field after `cost_source` and can corrupt retained cache data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyUnifiedMessageV7 {
+    client: String,
+    model_id: String,
+    provider_id: String,
+    session_id: String,
+    workspace_key: Option<String>,
+    workspace_label: Option<String>,
+    timestamp: i64,
+    date: String,
+    tokens: LegacyTokenBreakdownV8,
+    cost: f64,
+    cost_source: crate::sessions::CostSource,
+    duration_ms: Option<i64>,
+    message_count: i32,
+    agent: Option<String>,
+    dedup_key: Option<String>,
+    session_title: Option<String>,
+    is_turn_start: bool,
+    model_attribution_conflicted: bool,
+}
+
+impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
+    fn from(message: LegacyUnifiedMessageV7) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: None,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            parent_session_id: None,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+/// Rewrites a current message into the version-7 layout, so the migration
+/// tests can write the shards a previous release left behind.
+#[cfg(test)]
+impl From<UnifiedMessage> for LegacyUnifiedMessageV7 {
+    fn from(message: UnifiedMessage) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+fn migrate_legacy_messages(messages: Vec<LegacyUnifiedMessageV7>) -> Vec<UnifiedMessage> {
+    messages.into_iter().map(UnifiedMessage::from).collect()
+}
+
+/// UnifiedMessage wire layout used by cache format 8, before `cache_write_1h`
+/// was added. Structurally identical to the live `UnifiedMessage` (version 8
+/// already carried `service_tier`) except for the frozen token breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyUnifiedMessageV8 {
+    client: String,
+    model_id: String,
+    provider_id: String,
+    session_id: String,
+    workspace_key: Option<String>,
+    workspace_label: Option<String>,
+    timestamp: i64,
+    date: String,
+    tokens: LegacyTokenBreakdownV8,
+    cost: f64,
+    cost_source: crate::sessions::CostSource,
+    service_tier: Option<String>,
+    duration_ms: Option<i64>,
+    message_count: i32,
+    agent: Option<String>,
+    dedup_key: Option<String>,
+    session_title: Option<String>,
+    is_turn_start: bool,
+    model_attribution_conflicted: bool,
+}
+
+impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
+    fn from(message: LegacyUnifiedMessageV8) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            parent_session_id: None,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+impl From<UnifiedMessage> for LegacyUnifiedMessageV8 {
+    fn from(message: UnifiedMessage) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+fn migrate_legacy_v8_messages(messages: Vec<LegacyUnifiedMessageV8>) -> Vec<UnifiedMessage> {
+    messages.into_iter().map(UnifiedMessage::from).collect()
+}
+
+/// UnifiedMessage wire layout used by cache format 9, before
+/// `parent_session_id` was added. Everything else matches the live type,
+/// including `service_tier` and the 1-hour cache-write bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyUnifiedMessageV9 {
+    client: String,
+    model_id: String,
+    provider_id: String,
+    session_id: String,
+    workspace_key: Option<String>,
+    workspace_label: Option<String>,
+    timestamp: i64,
+    date: String,
+    tokens: LegacyTokenBreakdownV9,
+    cost: f64,
+    cost_source: crate::sessions::CostSource,
+    service_tier: Option<String>,
+    duration_ms: Option<i64>,
+    message_count: i32,
+    agent: Option<String>,
+    dedup_key: Option<String>,
+    session_title: Option<String>,
+    is_turn_start: bool,
+    model_attribution_conflicted: bool,
+}
+
+impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
+    fn from(message: LegacyUnifiedMessageV9) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            parent_session_id: None,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+/// Rewrites a current message into the version-9 layout, so the migration
+/// tests can write the shards the previous release left behind.
+#[cfg(test)]
+impl From<UnifiedMessage> for LegacyUnifiedMessageV9 {
+    fn from(message: UnifiedMessage) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens.into(),
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+fn migrate_legacy_v9_messages(messages: Vec<LegacyUnifiedMessageV9>) -> Vec<UnifiedMessage> {
+    messages.into_iter().map(UnifiedMessage::from).collect()
+}
+
+/// Exact version-7 entry layout, before UnifiedMessage gained service_tier.
+/// The serde-skipped MiMo metadata was stored beside entries in its own v8
+/// envelope and is therefore absent here.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV7 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<LegacyUnifiedMessageV7>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+}
+
+impl From<LegacyCachedSourceEntryV7> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV7) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: migrate_legacy_messages(entry.messages),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+            micode_metadata: None,
+        }
+    }
+}
+
+/// Exact version-8 entry layout, before `TokenBreakdown` gained
+/// `cache_write_1h`. Same shape as version 7 otherwise, since `service_tier`
+/// (the version-7-to-8 change) lives on the message, not the entry.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV8 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<LegacyUnifiedMessageV8>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+}
+
+impl From<LegacyCachedSourceEntryV8> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV8) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: migrate_legacy_v8_messages(entry.messages),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+            micode_metadata: None,
+        }
+    }
+}
+
+/// Exact version-9 entry layout, before `UnifiedMessage` gained
+/// `parent_session_id`. Same shape as version 8 otherwise, and it already
+/// carries the 1-hour cache-write bucket.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV9 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<LegacyUnifiedMessageV9>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+}
+
+impl From<LegacyCachedSourceEntryV9> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV9) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: migrate_legacy_v9_messages(entry.messages),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+            micode_metadata: None,
+        }
+    }
 }
 
 /// Exact version-4 entry layout. Keeping this wire type lets existing shards
@@ -1399,7 +2128,7 @@ struct LegacyCachedSourceEntryV4 {
     parser_version: u32,
     path: CachedPath,
     fingerprint: SourceFingerprint,
-    messages: Vec<UnifiedMessage>,
+    messages: Vec<LegacyUnifiedMessageV7>,
     fallback_timestamp_indices: Vec<usize>,
     codex_incremental: Option<CodexIncrementalCache>,
 }
@@ -1411,11 +2140,12 @@ impl From<LegacyCachedSourceEntryV4> for CachedSourceEntry {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: migrate_legacy_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: None,
             opencode_incremental: None,
+            micode_metadata: None,
         }
     }
 }
@@ -1429,7 +2159,7 @@ struct LegacyCachedSourceEntryV5 {
     parser_version: u32,
     path: CachedPath,
     fingerprint: SourceFingerprint,
-    messages: Vec<UnifiedMessage>,
+    messages: Vec<LegacyUnifiedMessageV7>,
     fallback_timestamp_indices: Vec<usize>,
     codex_incremental: Option<CodexIncrementalCache>,
     prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
@@ -1442,11 +2172,12 @@ impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: migrate_legacy_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
+            micode_metadata: None,
         }
     }
 }
@@ -1476,7 +2207,7 @@ struct LegacyCachedSourceEntryV6 {
     parser_version: u32,
     path: CachedPath,
     fingerprint: SourceFingerprint,
-    messages: Vec<UnifiedMessage>,
+    messages: Vec<LegacyUnifiedMessageV7>,
     fallback_timestamp_indices: Vec<usize>,
     codex_incremental: Option<CodexIncrementalCache>,
     prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
@@ -1490,11 +2221,12 @@ impl From<LegacyCachedSourceEntryV6> for CachedSourceEntry {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: migrate_legacy_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
+            micode_metadata: None,
         }
     }
 }
@@ -1518,7 +2250,22 @@ impl CachedSourceEntry {
             codex_incremental,
             prime_accounting: None,
             opencode_incremental: None,
+            micode_metadata: None,
         }
+    }
+
+    pub(crate) fn with_micode_metadata(
+        mut self,
+        metadata: Vec<crate::sessions::micode::MiMoRowMetadata>,
+    ) -> Self {
+        self.micode_metadata = Some(metadata);
+        self
+    }
+
+    pub(crate) fn has_valid_micode_metadata(&self) -> bool {
+        self.micode_metadata.as_ref().is_some_and(|metadata| {
+            metadata.len() == self.messages.len() && metadata.iter().all(|row| row.is_valid())
+        })
     }
 
     /// Attach the mark a later OpenCode scan resumes from.
@@ -1567,6 +2314,7 @@ impl CachedSourceEntry {
             codex_incremental: self.codex_incremental.take(),
             prime_accounting: self.prime_accounting.take(),
             opencode_incremental: self.opencode_incremental.take(),
+            micode_metadata: self.micode_metadata.take(),
         }
     }
 
@@ -2316,6 +3064,20 @@ fn read_shard(path: &Path, identity: CacheIdentity) -> ShardReadStatus {
     read_shard_with_limit(path, identity, MAX_CACHE_SHARD_BYTES)
 }
 
+/// Every legacy format that predates the 1-hour split migrates through here:
+/// a Claude entry with no 1-hour split drops its retention marker so the next
+/// scan reparses the live file.
+fn migrated_shard(mut entries: Vec<CachedSourceEntry>) -> ShardReadStatus {
+    for entry in &mut entries {
+        if entry.is_claude_namespace() {
+            entry
+                .fallback_timestamp_indices
+                .retain(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER);
+        }
+    }
+    ShardReadStatus::Migrated(entries)
+}
+
 fn read_shard_with_limit(
     path: &Path,
     identity: CacheIdentity,
@@ -2353,48 +3115,189 @@ fn read_shard_with_limit(
         return ShardReadStatus::Stale;
     }
 
-    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V4 {
+    if envelope.format_version == MICODE_CACHE_FORMAT_VERSION {
+        if identity.namespace != ClientId::MiMoCode.as_str() {
+            return ShardReadStatus::Stale;
+        }
+        type MiMoWireEntry = (
+            CachedSourceEntry,
+            Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+        );
         return match bincode::options()
             .with_limit(max_shard_bytes)
-            .deserialize::<Vec<LegacyCachedSourceEntryV4>>(&envelope.payload)
+            .deserialize::<Vec<MiMoWireEntry>>(&envelope.payload)
         {
-            Ok(entries) => ShardReadStatus::Migrated(
-                entries.into_iter().map(CachedSourceEntry::from).collect(),
+            Ok(entries) => ShardReadStatus::Loaded(
+                entries
+                    .into_iter()
+                    .map(|(mut entry, metadata)| {
+                        entry.micode_metadata = metadata;
+                        if !entry.has_valid_micode_metadata() {
+                            // Keep the messages available for diagnostics, but force
+                            // the MiMo loader to rebuild the entire matched pair.
+                            entry.micode_metadata = None;
+                        }
+                        entry
+                    })
+                    .collect(),
             ),
             Err(error) => ShardReadStatus::Invalid(error.to_string()),
         };
-    }
-    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V5 {
-        return match bincode::options()
-            .with_limit(max_shard_bytes)
-            .deserialize::<Vec<LegacyCachedSourceEntryV5>>(&envelope.payload)
-        {
-            Ok(entries) => ShardReadStatus::Migrated(
-                entries.into_iter().map(CachedSourceEntry::from).collect(),
-            ),
-            Err(error) => ShardReadStatus::Invalid(error.to_string()),
-        };
-    }
-    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V6 {
-        return match bincode::options()
-            .with_limit(max_shard_bytes)
-            .deserialize::<Vec<LegacyCachedSourceEntryV6>>(&envelope.payload)
-        {
-            Ok(entries) => ShardReadStatus::Migrated(
-                entries.into_iter().map(CachedSourceEntry::from).collect(),
-            ),
-            Err(error) => ShardReadStatus::Invalid(error.to_string()),
-        };
-    }
-    if envelope.format_version != CACHE_FORMAT_VERSION {
-        return ShardReadStatus::Stale;
     }
 
+    if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V10
+        && identity.namespace == ClientId::MiMoCode.as_str()
+    {
+        type LegacyMiMoWireEntryV10 = (
+            LegacyCachedSourceEntryV9,
+            Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyMiMoWireEntryV10>>(&envelope.payload)
+        {
+            Ok(entries) => migrated_shard(
+                entries
+                    .into_iter()
+                    .map(|(legacy_entry, metadata)| {
+                        let mut entry = CachedSourceEntry::from(legacy_entry);
+                        entry.micode_metadata = metadata;
+                        if !entry.has_valid_micode_metadata() {
+                            // Keep messages available but make the MiMo loader
+                            // rebuild an invalid or absent provenance pair.
+                            entry.micode_metadata = None;
+                        }
+                        entry
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
+    if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V9
+        && identity.namespace == ClientId::MiMoCode.as_str()
+    {
+        type LegacyMiMoWireEntryV9 = (
+            LegacyCachedSourceEntryV8,
+            Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyMiMoWireEntryV9>>(&envelope.payload)
+        {
+            Ok(entries) => migrated_shard(
+                entries
+                    .into_iter()
+                    .map(|(legacy_entry, metadata)| {
+                        let mut entry = CachedSourceEntry::from(legacy_entry);
+                        entry.micode_metadata = metadata;
+                        if !entry.has_valid_micode_metadata() {
+                            // Keep messages available but make the MiMo loader
+                            // rebuild an invalid or absent provenance pair.
+                            entry.micode_metadata = None;
+                        }
+                        entry
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
+    // MiMo's released envelope, whose nested entry is the version-7 layout:
+    // it predates `service_tier`, `cache_write_1h`, and `parent_session_id`.
+    // Only MiMo can hold one, and MiMo's parser version rides the `opencode
+    // schema` family rather than the Pi one, so the messages migrate like any
+    // other legacy shard instead of being reported as corruption. The
+    // provenance stored beside the entry survives, which is what the envelope
+    // exists to keep.
+    if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V8
+        && identity.namespace == ClientId::MiMoCode.as_str()
+    {
+        type LegacyMiMoWireEntry = (
+            LegacyCachedSourceEntryV7,
+            Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyMiMoWireEntry>>(&envelope.payload)
+        {
+            Ok(entries) => migrated_shard(
+                entries
+                    .into_iter()
+                    .map(|(legacy_entry, metadata)| {
+                        let mut entry = CachedSourceEntry::from(legacy_entry);
+                        entry.micode_metadata = metadata;
+                        if !entry.has_valid_micode_metadata() {
+                            // Keep messages available but make the MiMo loader
+                            // rebuild an invalid or absent provenance pair.
+                            entry.micode_metadata = None;
+                        }
+                        entry
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
+    match envelope.format_version {
+        LEGACY_CACHE_FORMAT_VERSION_V4 => {
+            migrate_legacy_shard::<LegacyCachedSourceEntryV4>(&envelope.payload, max_shard_bytes)
+        }
+        LEGACY_CACHE_FORMAT_VERSION_V5 => {
+            migrate_legacy_shard::<LegacyCachedSourceEntryV5>(&envelope.payload, max_shard_bytes)
+        }
+        LEGACY_CACHE_FORMAT_VERSION_V6 => {
+            migrate_legacy_shard::<LegacyCachedSourceEntryV6>(&envelope.payload, max_shard_bytes)
+        }
+        LEGACY_CACHE_FORMAT_VERSION_V7 => {
+            migrate_legacy_shard::<LegacyCachedSourceEntryV7>(&envelope.payload, max_shard_bytes)
+        }
+        LEGACY_CACHE_FORMAT_VERSION_V8 => {
+            migrate_legacy_shard::<LegacyCachedSourceEntryV8>(&envelope.payload, max_shard_bytes)
+        }
+        // Version 9 already carries `cache_write_1h`, so unlike the older
+        // formats it keeps the Claude retention provenance marker: the
+        // entry's token split is complete and a reparse would only churn the
+        // retained set. It therefore does not go through `migrated_shard`.
+        LEGACY_CACHE_FORMAT_VERSION_V9 => {
+            match bincode::options()
+                .with_limit(max_shard_bytes)
+                .deserialize::<Vec<LegacyCachedSourceEntryV9>>(&envelope.payload)
+            {
+                Ok(entries) => ShardReadStatus::Migrated(
+                    entries.into_iter().map(CachedSourceEntry::from).collect(),
+                ),
+                Err(error) => ShardReadStatus::Invalid(error.to_string()),
+            }
+        }
+        CACHE_FORMAT_VERSION => match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Loaded(entries),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        },
+        _ => ShardReadStatus::Stale,
+    }
+}
+
+/// Decode a pre-`cache_write_1h` shard into its exact legacy wire type and
+/// convert every entry to the current layout. Shared by the v4-v8 migration
+/// arms: each legacy entry type only differs in the fields it carries beside
+/// `messages`, and all of them go through [`migrated_shard`] so a Claude entry
+/// drops retention provenance it can no longer vouch for.
+fn migrate_legacy_shard<T>(payload: &[u8], max_shard_bytes: u64) -> ShardReadStatus
+where
+    T: serde::de::DeserializeOwned + Into<CachedSourceEntry>,
+{
     match bincode::options()
         .with_limit(max_shard_bytes)
-        .deserialize(&envelope.payload)
+        .deserialize::<Vec<T>>(payload)
     {
-        Ok(entries) => ShardReadStatus::Loaded(entries),
+        Ok(entries) => migrated_shard(entries.into_iter().map(Into::into).collect()),
         Err(error) => ShardReadStatus::Invalid(error.to_string()),
     }
 }
@@ -2405,12 +3308,27 @@ fn write_shard_with_limit(
     entries: &[CachedSourceEntry],
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
-    let payload = bincode::options()
-        .with_limit(max_shard_bytes)
-        .serialize(entries)
-        .map_err(std::io::Error::other)?;
+    let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
+    let payload = if is_micode {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry, &entry.micode_metadata))
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&entries)
+    } else {
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(entries)
+    }
+    .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
-        format_version: CACHE_FORMAT_VERSION,
+        format_version: if is_micode {
+            MICODE_CACHE_FORMAT_VERSION
+        } else {
+            CACHE_FORMAT_VERSION
+        },
         parser_namespace: identity.namespace.to_string(),
         parser_version: identity.parser_version,
         payload,
@@ -2953,6 +3871,7 @@ mod tests {
                     output: 2,
                     cache_read: 3,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 0.0,
@@ -2960,6 +3879,66 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    fn legacy_v7_entry(entry: CachedSourceEntry) -> LegacyCachedSourceEntryV7 {
+        LegacyCachedSourceEntryV7 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+        }
+    }
+
+    fn to_legacy_v7_messages(messages: Vec<UnifiedMessage>) -> Vec<LegacyUnifiedMessageV7> {
+        messages.into_iter().map(Into::into).collect()
+    }
+
+    fn legacy_v8_entry(entry: CachedSourceEntry) -> LegacyCachedSourceEntryV8 {
+        LegacyCachedSourceEntryV8 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+        }
+    }
+
+    fn legacy_v9_entry(entry: CachedSourceEntry) -> LegacyCachedSourceEntryV9 {
+        LegacyCachedSourceEntryV9 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+        }
+    }
+
+    fn legacy_v6_entry(entry: CachedSourceEntry) -> LegacyCachedSourceEntryV6 {
+        LegacyCachedSourceEntryV6 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        }
     }
 
     fn write_sources_in_distinct_shards(
@@ -3288,17 +4267,82 @@ mod tests {
     }
 
     #[test]
-    fn test_devin_parser_versions_invalidate_v1_entries() {
-        assert_eq!(parser_version(ClientId::DevinCli), 3);
+    #[serial_test::serial]
+    fn hindsight_v1_shards_reparse_cache_inclusive_usage() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_root = TempDir::new().unwrap();
+        let source = source_root.path().join("2026-09.jsonl");
+        std::fs::write(
+            &source,
+            br#"{"id":"cached-request","provider":"openai","model":"gpt-test","started_at":"2026-09-01T08:16:51Z","input_tokens":100,"output_tokens":20,"cached_tokens":40}"#,
+        )
+        .unwrap();
+        let current_identity = CacheIdentity::for_client(ClientId::Hindsight);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 1,
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let rebuilt = crate::sessions::hindsight::parse_hindsight_file(&source);
+        let mut stale_messages = rebuilt.clone();
+        stale_messages[0].tokens.input = 100;
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            stale_messages,
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, &source);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current_identity, &source).is_none(),
+            "v1 cache must not keep double-counted input for an unchanged ledger"
+        );
+        assert_eq!(rebuilt[0].tokens.input, 60);
+        assert_eq!(rebuilt[0].tokens.total(), 120);
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            &source,
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, &source).unwrap();
+        assert_eq!(cached.messages, rebuilt);
+    }
+
+    #[test]
+    fn test_devin_parser_versions_invalidate_v3_entries() {
+        assert_eq!(parser_version(ClientId::DevinCli), 4);
         assert_eq!(parser_version(ClientId::DevinDesktop), 2);
     }
 
     #[test]
-    fn test_codex_duration_parser_version_invalidates_v4_entries() {
+    fn test_codex_parser_version_invalidates_v10_entries() {
         // v6->v7 splits `reasoning_output_tokens` out of the Codex output
-        // bucket. The bump is what stops an existing cache from replaying
-        // pre-split rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 7);
+        // bucket, v7->v8 retags rollouts OpenClaw originated as openclaw, and
+        // v8->v9 buckets agent attribution into "Codex" / "Codex Subagent" /
+        // "Codex Guardian" / "Codex Headless" instead of the per-thread random
+        // nickname; v9->v10 retains service_tier for Fast mode pricing, and
+        // v10->v11 resets duration anchors at standalone task_started events.
+        // Each bump is what stops an existing cache from replaying the old
+        // rows, so it has to be asserted rather than assumed.
+        assert_eq!(parser_version(ClientId::Codex), 11);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -3323,48 +4367,142 @@ mod tests {
         // cache entries are also invalidated.
         assert_eq!(parser_version(ClientId::Junie), 3);
         assert_eq!(parser_version(ClientId::Jcode), 7);
-        assert_eq!(parser_version(ClientId::DevinCli), 3);
+        assert_eq!(parser_version(ClientId::DevinCli), 4);
         assert_eq!(parser_version(ClientId::Zcode), 3);
         assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
         assert_eq!(parser_version(ClientId::Kiro), 2);
     }
 
     #[test]
-    fn test_kimi_parser_version_invalidates_v3_entries() {
-        assert_eq!(parser_version(ClientId::Kimi), 4);
+    fn test_kimi_parser_version_invalidates_v4_entries() {
+        assert_eq!(parser_version(ClientId::Kimi), 5);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_kimi_v5_cache_reused_with_current_workspace_metadata() {
+        let cache_home = TempDir::new().unwrap();
+        let source_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(cache_home.path());
+        let root = source_home.path().join(".kimi-code");
+        let wire_path = root
+            .join("sessions")
+            .join("workspace")
+            .join("session")
+            .join("agents")
+            .join("main")
+            .join("wire.jsonl");
+        std::fs::create_dir_all(wire_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &wire_path,
+            r#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":100,"output":50,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1780319377014}"#,
+        )
+        .unwrap();
+        let mut cached_messages = crate::sessions::kimi::parse_kimi_code_file(&wire_path);
+        assert_eq!(cached_messages.len(), 1);
+        // A full reparse would restore the path-derived session ID, so this
+        // marker distinguishes a cache hit from equivalent parsed usage.
+        cached_messages[0].session_id = "cache-hit-marker".to_string();
+        let identity = CacheIdentity {
+            namespace: "kimi",
+            parser_version: 5,
+        };
+        let fingerprint = SourceFingerprint::from_kimi_path(&wire_path).unwrap();
+        let mut cache = SourceMessageCache::default();
+        cache.insert(CachedSourceEntry::new(
+            identity,
+            &wire_path,
+            fingerprint,
+            cached_messages.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        for name in ["first", "renamed"] {
+            let workspace = format!("/projects/{name}");
+            std::fs::write(
+                root.join("workspaces.json"),
+                serde_json::json!({
+                    "version": 1,
+                    "workspaces": { "workspace": { "root": workspace, "name": name } }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let messages = crate::parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["kimi".to_string()],
+                None,
+                false,
+                &crate::scanner::ScannerSettings::default(),
+            );
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].session_id, "cache-hit-marker");
+            assert_eq!(
+                messages[0].workspace_key.as_deref(),
+                Some(workspace.as_str())
+            );
+            assert_eq!(messages[0].workspace_label.as_deref(), Some(name));
+            assert_eq!(messages[0].tokens, cached_messages[0].tokens);
+
+            let persisted = SourceMessageCache::load();
+            let entry = persisted.get(identity, &wire_path).unwrap();
+            assert_eq!(entry.messages, cached_messages);
+        }
+    }
+
+    /// Successive parser changes each need their own version. #1285 took v2
+    /// for the compressed-archive decode. #1278 then needed v3, not a reuse of
+    /// 2: a warm v2 cache carries neither the dedup keys nor the reasoning
+    /// split, so reusing 2 would have left every reader who already scanned
+    /// under #1285 unmigrated. #1293 needs v4 for the same reason one step
+    /// on: dropping checkpoint snapshots from discovery cannot reach the
+    /// source cache, so only the version can retire TUI aggregates that
+    /// still include them. #1299 needs v5: the doctor's `archive-tier.`
+    /// import archives never change on disk, so a v4 entry that named their
+    /// sessions by the archived spelling is served warm forever. #1298 needs
+    /// v6 because legacy CLI-auth Codex rollout bytes were cached as empty
+    /// OpenClaw transcripts before their path classification changed.
+    /// v7 retires SQLite scans that omitted compressed transcript rows.
+    #[test]
+    fn test_openclaw_parser_version_invalidates_v6_entries() {
+        assert_eq!(parser_version(ClientId::OpenClaw), 7);
     }
 
     #[test]
     fn test_lossy_jsonl_parser_versions_invalidate_v3_entries() {
-        assert_eq!(parser_version(ClientId::PrimeAgent), 4);
+        assert_eq!(parser_version(ClientId::PrimeAgent), 6);
         assert_eq!(parser_version(ClientId::Reasonix), 4);
     }
 
     #[test]
     #[serial_test::serial]
     fn prime_and_reasonix_v3_shards_are_rejected_before_changed_bytes_are_parsed() {
-        for (client, source_bytes, stale_provider, expected_provider) in [
+        for (client, source_bytes, stale_provider, expected_provider, expected_current_version) in [
             (
                 ClientId::PrimeAgent,
                 b"{\"type\":\"session\",\"version\":3,\"id\":\"root\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"id\":\"valid\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n".as_slice(),
                 "stale-prime-v3",
                 "anthropic",
+                6,
             ),
             (
                 ClientId::Reasonix,
                 b"{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":100,\"completion\":20,\"total\":120}\n".as_slice(),
                 "stale-reasonix-v3",
                 "deepseek",
+                4,
             ),
         ] {
             let temp_home = TempDir::new().unwrap();
             let _cache_env = sandbox_cache_env(temp_home.path());
             let source = write_temp_file(source_bytes);
             let current_identity = CacheIdentity::for_client(client);
-            assert_eq!(current_identity.parser_version, 4);
+            assert_eq!(current_identity.parser_version, expected_current_version);
             let stale_identity = CacheIdentity {
                 namespace: current_identity.namespace,
-                parser_version: 3,
+                parser_version: expected_current_version - 1,
             };
             let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
             let stale_entry = CachedSourceEntry::new(
@@ -3382,6 +4520,7 @@ mod tests {
                         output: 0,
                         cache_read: 0,
                         cache_write: 0,
+                        cache_write_1h: 0,
                         reasoning: 0,
                     },
                     0.0,
@@ -3423,7 +4562,7 @@ mod tests {
 
             let warm = SourceMessageCache::load();
             let cached = warm.get(current_identity, source.path()).unwrap();
-            assert_eq!(cached.parser_version, 4);
+            assert_eq!(cached.parser_version, expected_current_version);
             assert_eq!(cached.messages, rebuilt);
         }
     }
@@ -3485,6 +4624,7 @@ mod tests {
                 output: 20,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -3547,11 +4687,523 @@ mod tests {
     }
 
     #[test]
-    fn test_dsh_compaction_identity_parser_version_invalidates_v4_entries() {
-        // A finished transcript is never rewritten when attribution starts
-        // preferring compactionId, so its fingerprint remains valid and only
-        // the parser version can retire the seq-keyed row released in v4.14.0.
-        assert_eq!(parser_version(ClientId::Dsh), 5);
+    #[serial_test::serial]
+    fn openclaw_compressed_archives_discard_cached_empty_v1_results() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = temp_home.path().join("session.jsonl.deleted.timestamp.zst");
+        let content = br#"{"type":"message","message":{"role":"assistant","model":"example","usage":{"input":100},"timestamp":1700000000000}}"#;
+        fs::write(&source, zstd::encode_all(&content[..], 0).unwrap()).unwrap();
+        let identity = CacheIdentity::for_client(ClientId::OpenClaw);
+        let old_identity = CacheIdentity {
+            parser_version: 1,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let entry = CachedSourceEntry::new(
+            old_identity,
+            &source,
+            fingerprint.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(&shard, old_identity, &[entry], MAX_CACHE_SHARD_BYTES).unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(identity, &source).is_none());
+        let parsed = crate::sessions::openclaw::parse_openclaw_transcript(&source);
+        assert_eq!(parsed.len(), 1);
+        cache.insert(CachedSourceEntry::new(
+            identity,
+            &source,
+            fingerprint,
+            parsed.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load();
+        assert_eq!(warm.get(identity, &source).unwrap().messages, parsed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openclaw_v4_shards_are_reparsed_with_import_archive_session_ids() {
+        // `openclaw doctor` parks unreferenced legacy JSONL under
+        // `session-sqlite-import-archive/archive-tier.<session id>.jsonl
+        // .imported-<ts>` and never writes to it again, so its fingerprint
+        // stays valid for good. A v4 entry holds the file's rows under the
+        // archived spelling of the session id, and the loader serves a
+        // nonempty entry for an unchanged file without calling the parser,
+        // so only the version bump can retire it.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let archive = temp_home
+            .path()
+            .join("agents/main")
+            .join(crate::sessions::openclaw::OPENCLAW_IMPORT_ARCHIVE_DIRNAME);
+        fs::create_dir_all(&archive).unwrap();
+        let source = archive
+            .join("archive-tier.3139ce31-e15e-4f1b-a4b0-350a525f4331.jsonl.imported-1788148544385");
+        fs::write(
+            &source,
+            br#"{"type":"message","id":"msg1","message":{"role":"assistant","content":[],"provider":"openai","model":"gpt-5.4","usage":{"input":10,"output":5},"timestamp":1700000000000}}"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::OpenClaw);
+        let stale_identity = CacheIdentity {
+            parser_version: 4,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                identity.namespace,
+                "gpt-5.4",
+                "openai",
+                "archive-tier.3139ce31-e15e-4f1b-a4b0-350a525f4331",
+                1700000000000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )],
+            Vec::new(),
+            None,
+        );
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(identity, &source).is_none(),
+            "a v4 entry names the session by its archived spelling and must not be served"
+        );
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+        let parsed = crate::sessions::openclaw::parse_openclaw_transcript(&source);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].session_id, "3139ce31-e15e-4f1b-a4b0-350a525f4331");
+        cache.insert(CachedSourceEntry::new(
+            identity,
+            &source,
+            fingerprint,
+            parsed.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(identity, &source).unwrap();
+        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.messages, parsed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openclaw_v6_sqlite_shards_are_reparsed_with_compressed_rows() {
+        use crate::sessions::openclaw::{scan_openclaw_sqlite, test_fixtures::*};
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = temp_home.path().join("openclaw-agent.sqlite");
+        let conn = create_compressed_agent_db(&source);
+        let plain = assistant_event(
+            "a1",
+            "openai",
+            "gpt-4.1",
+            r#"{"input":100,"output":20}"#,
+            1_756_548_001_000,
+        );
+        let compressed = assistant_event(
+            "a2",
+            "openai",
+            "gpt-4.1",
+            r#"{"input":300,"output":40}"#,
+            1_756_548_002_000,
+        );
+        insert_event(&conn, "sess-a", 0, &plain, 1_756_548_001_000);
+        insert_compressed_event(&conn, "sess-a", 1, &compressed, 1_756_548_002_000);
+        drop(conn);
+        let parsed = scan_openclaw_sqlite(&source);
+        assert!(parsed.complete);
+        assert_eq!(parsed.messages.len(), 2);
+
+        let identity = CacheIdentity::for_client(ClientId::OpenClaw);
+        let stale_identity = CacheIdentity {
+            parser_version: 6,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_sqlite_path(&source).unwrap();
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            parsed.messages[..1].to_vec(),
+            Vec::new(),
+            None,
+        );
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(identity, &source).is_none(),
+            "v6's nonempty undercount must be discarded"
+        );
+        assert_eq!(
+            SourceFingerprint::from_sqlite_path(&source).unwrap(),
+            fingerprint
+        );
+        let reparsed = scan_openclaw_sqlite(&source);
+        assert!(reparsed.complete);
+        assert_eq!(reparsed.messages, parsed.messages);
+        cache.insert(CachedSourceEntry::new(
+            identity,
+            &source,
+            fingerprint,
+            reparsed.messages.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load();
+        assert_eq!(
+            warm.get(identity, &source).unwrap().messages,
+            reparsed.messages
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openclaw_v5_empty_shards_are_rejected_before_cli_auth_reclassification() {
+        // Legacy CLI-auth Codex rollout bytes never change after their former
+        // OpenClaw-transcript parse cached them as empty, so v6 must retire the
+        // unchanged v5 shard before the location-based parser can read them.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = temp_home.path().join(
+            "agents/main/agent/cli-auth/codex/default/sessions/2026/08/30/rollout-2026-08-30T10-00-00-0192f3a4-5b6c-7d8e-9f01-23456789abcd.jsonl",
+        );
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            br#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"0192f3a4-5b6c-7d8e-9f01-23456789abcd","originator":"codex_exec","source":"exec"}}"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::OpenClaw);
+        let stale_identity = CacheIdentity {
+            parser_version: 5,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let cache = SourceMessageCache::load();
+        assert!(
+            cache.get(identity, &source).is_none(),
+            "a v5 empty transcript entry must not mask a legacy CLI-auth rollout"
+        );
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+    }
+
+    #[test]
+    fn test_dsh_attempt_identity_parser_version_invalidates_v6_entries() {
+        // DSH transcript files are append-only, so v6 cache entries keep the
+        // old cross-session attempt keys unless the source is reparsed.
+        assert_eq!(parser_version(ClientId::Dsh), 7);
+    }
+
+    /// Names the row that only a served cache can put in a report. No DSH
+    /// transcript in this repo produces it, so its presence is proof the scan
+    /// read the cache and its absence is proof the scan parsed the source.
+    const DSH_CACHE_MARKER: &str = "cache-only-marker";
+
+    fn cache_only_marker_row() -> UnifiedMessage {
+        UnifiedMessage::new(
+            "dsh",
+            format!("{DSH_CACHE_MARKER}-model"),
+            format!("{DSH_CACHE_MARKER}-provider"),
+            format!("{DSH_CACHE_MARKER}-session"),
+            1,
+            crate::TokenBreakdown {
+                input: 12345,
+                output: 678,
+                cache_read: 90,
+                cache_write: 9,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.0,
+        )
+    }
+
+    fn report_carries_the_cache_marker(messages: &[UnifiedMessage]) -> bool {
+        messages.iter().any(|message| {
+            message.model_id.contains(DSH_CACHE_MARKER)
+                || message.provider_id.contains(DSH_CACHE_MARKER)
+                || message.session_id.contains(DSH_CACHE_MARKER)
+        })
+    }
+
+    /// A marker row tagged with a label, so a report can be asked not merely
+    /// *whether* a cache-only row reached it but *which* seeded shard produced
+    /// it. A whole-cache load bug that serves a stale shard surfaces that
+    /// shard's label specifically -- something an unlabelled marker, shared by
+    /// every seeded shard, cannot tell apart from the current shard being
+    /// served as intended.
+    fn named_marker_row(label: &str) -> UnifiedMessage {
+        UnifiedMessage::new(
+            "dsh",
+            format!("{DSH_CACHE_MARKER}-{label}-model"),
+            format!("{DSH_CACHE_MARKER}-{label}-provider"),
+            format!("{DSH_CACHE_MARKER}-{label}-session"),
+            1,
+            crate::TokenBreakdown {
+                input: 12345,
+                output: 678,
+                cache_read: 90,
+                cache_write: 9,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.0,
+        )
+    }
+
+    fn report_carries_marker_labelled(messages: &[UnifiedMessage], label: &str) -> bool {
+        let needle = format!("{DSH_CACHE_MARKER}-{label}-");
+        messages.iter().any(|message| {
+            message.model_id.contains(&needle)
+                || message.provider_id.contains(&needle)
+                || message.session_id.contains(&needle)
+        })
+    }
+
+    /// Seeds one marker row per transcript into shards whose envelope carries
+    /// `seeded_version`, and asserts each shard then reads the way the version
+    /// implies: stale when it is a predecessor's, current when it is the
+    /// running one. [`seed_dsh_cache_at_version`] and the mixed-shard test both
+    /// build their caches through this; the two directions are what a *mixed*
+    /// cache pairs in a single load.
+    ///
+    /// Going through `write_shard_with_limit` instead of the cache API is the
+    /// point. `save_if_dirty` stamps every shard it writes with the running
+    /// identity, so a stale entry seeded that way would land inside a
+    /// current-identity envelope and only the per-entry checks could reject it.
+    /// A predecessor's real cache is rejected one level earlier —
+    /// `read_shard_with_limit` compares the envelope before it decodes anything
+    /// — and that earlier level is what an upgrading user actually hits.
+    fn seed_dsh_shards_at_version(
+        transcripts: &[PathBuf],
+        seeded_version: u32,
+        marker: UnifiedMessage,
+    ) {
+        let identity = CacheIdentity::for_client(ClientId::Dsh);
+        let seeded_identity = CacheIdentity {
+            namespace: identity.namespace,
+            parser_version: seeded_version,
+        };
+        let mut by_shard: HashMap<CacheShardKey, Vec<CachedSourceEntry>> = HashMap::new();
+        for path in transcripts {
+            let entry = CachedSourceEntry::new(
+                seeded_identity,
+                path,
+                SourceFingerprint::from_path(path).expect("an installed transcript fingerprints"),
+                vec![marker.clone()],
+                Vec::new(),
+                None,
+            );
+            by_shard
+                .entry(CacheKey::from_entry(&entry).shard())
+                .or_default()
+                .push(entry);
+        }
+        let shard_root = cache_shard_dir().expect("a sandboxed shard directory");
+        let expect_stale = seeded_version != identity.parser_version;
+        for (shard_key, entries) in &by_shard {
+            let path = shard_path(&shard_root, shard_key);
+            ensure_cache_dir(path.parent().unwrap()).unwrap();
+            write_shard_with_limit(&path, seeded_identity, entries, MAX_CACHE_SHARD_BYTES).unwrap();
+            // Assert the precondition rather than assume it: a helper that
+            // quietly wrote the wrong envelope would leave the scan with nothing
+            // to reject (stale) or nothing to serve (current), and the test
+            // would pass without running what it claims to cover.
+            let status = read_shard(&path, identity);
+            if expect_stale {
+                assert!(
+                    matches!(status, ShardReadStatus::Stale),
+                    "a shard seeded at parser version {seeded_version} must read as stale \
+                     under the running identity"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        status,
+                        ShardReadStatus::Loaded(_) | ShardReadStatus::Migrated(_)
+                    ),
+                    "a shard seeded at the running parser version must read as current"
+                );
+            }
+        }
+    }
+
+    /// The checked-in DSH fixtures, under `crates/tokscale-core/tests/fixtures`.
+    /// Each holds a `sessions/` tree and an `expected.json` recording what the
+    /// current parser reports and what the released predecessor reported.
+    fn dsh_fixture_dir(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn dsh_fixture_expectations(name: &str) -> serde_json::Value {
+        let path = dsh_fixture_dir(name).join("expected.json");
+        serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display())),
+        )
+        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", path.display()))
+    }
+
+    /// Copies a fixture's `sessions/` tree to `<source_home>/.dsh/sessions`,
+    /// the root `ClientId::Dsh` resolves to for a scan that does not read
+    /// environment roots, and returns every transcript it installed.
+    fn install_dsh_fixture(source_home: &Path, name: &str) -> Vec<PathBuf> {
+        let fixture_sessions = dsh_fixture_dir(name).join("sessions");
+        let installed_root = source_home.join(".dsh").join("sessions");
+        let mut transcripts = Vec::new();
+        for entry in walkdir::WalkDir::new(&fixture_sessions) {
+            let entry = entry.unwrap_or_else(|error| {
+                panic!("{} is unreadable: {error}", fixture_sessions.display())
+            });
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&fixture_sessions)
+                .expect("the walk stays under the fixture");
+            let installed = installed_root.join(relative);
+            std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+            std::fs::copy(entry.path(), &installed).unwrap();
+            transcripts.push(installed);
+        }
+        transcripts.sort();
+        assert!(
+            !transcripts.is_empty(),
+            "fixture {name} installed no transcripts"
+        );
+        transcripts
+    }
+
+    /// One DSH transcript where the production scan looks for it.
+    fn write_dsh_transcript(source_home: &Path, session_id: &str, body: &[u8]) -> PathBuf {
+        let dir = source_home
+            .join(".dsh")
+            .join("sessions")
+            .join("--test--")
+            .join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Runs the production DSH lane the way `tokscale --json` does: one cached
+    /// scan, no pricing service, no environment-provided scan roots.
+    fn scan_dsh(source_home: &Path) -> Vec<UnifiedMessage> {
+        crate::parse_all_messages_with_pricing_with_env_strategy(
+            source_home.to_str().expect("UTF-8 fixture path"),
+            &["dsh".to_owned()],
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+        )
+    }
+
+    /// A scan's answer in the shape `expected.json` records: totals summed over
+    /// the report entries, and one row per `client/provider/model`. Going
+    /// through the real aggregation keeps the fixture graded on the figures a
+    /// user reads rather than on a sum this test invented.
+    fn dsh_report_json(messages: &[UnifiedMessage]) -> serde_json::Value {
+        let entries =
+            crate::aggregate_model_usage_entries(messages.to_vec(), &crate::GroupBy::ClientModel);
+        let (input, output, cache_read, cache_write) = crate::model_report_token_totals(&entries);
+        let mut models = serde_json::Map::new();
+        for entry in &entries {
+            models.insert(
+                format!("{}/{}/{}", entry.client, entry.provider, entry.model),
+                serde_json::json!({
+                    "input": entry.input,
+                    "output": entry.output,
+                    "cacheRead": entry.cache_read,
+                    "cacheWrite": entry.cache_write,
+                    "reasoning": entry.reasoning,
+                    "messageCount": entry.message_count,
+                }),
+            );
+        }
+        serde_json::json!({
+            "totals": {
+                "totalInput": input,
+                "totalOutput": output,
+                "totalCacheRead": cache_read,
+                "totalCacheWrite": cache_write,
+                "totalMessages": entries.iter().map(|entry| entry.message_count).sum::<i32>(),
+            },
+            "models": models,
+        })
+    }
+
+    /// The predecessor-only seeding the existing gate uses: an unlabelled
+    /// marker at a retired identity. Delegates to
+    /// [`seed_dsh_shards_at_version`], which carries the rationale for writing
+    /// the shard directly.
+    fn seed_dsh_cache_at_version(transcripts: &[PathBuf], parser_version: u32) {
+        seed_dsh_shards_at_version(transcripts, parser_version, cache_only_marker_row());
     }
 
     #[test]
@@ -3559,21 +5211,26 @@ mod tests {
     fn dsh_v3_shards_are_reparsed_with_the_concrete_served_model() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
-        let source = write_temp_file(
+        let source_home = TempDir::new().unwrap();
+        let source = write_dsh_transcript(
+            source_home.path(),
+            "session-served",
             br#"{"type":"session","id":"session-served","createdAt":1,"cwd":"/work"}
 {"type":"assistant/message","seq":42,"time":1787122684043,"data":{"turn":1,"message":{"id":"m-served","source":{"kind":"model","provider":"zai-coding-cn","model":"glm-5.2","replayState":{"response":{"responseModel":"glm-5.3"}}}},"usage":{"inputTokens":8425,"outputTokens":207,"cacheReadTokens":576}}}
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 5);
+        assert_eq!(current_identity.parser_version, 7);
+        // Pinned at 3, the identity 4.14.0 cached under, rather than derived
+        // from the running version: this is the row that release left on disk.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 3,
         };
-        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let stale_entry = CachedSourceEntry::new(
             stale_identity,
-            source.path(),
+            &source,
             fingerprint.clone(),
             vec![UnifiedMessage::new(
                 current_identity.namespace,
@@ -3586,6 +5243,7 @@ mod tests {
                     output: 0,
                     cache_read: 0,
                     cache_write: 0,
+                    cache_write_1h: 0,
                     reasoning: 0,
                 },
                 0.0,
@@ -3593,7 +5251,7 @@ mod tests {
             Vec::new(),
             None,
         );
-        let stale_path = cache_shard_path(current_identity, source.path());
+        let stale_path = cache_shard_path(current_identity, &source);
         ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
         write_shard_with_limit(
             &stale_path,
@@ -3603,31 +5261,37 @@ mod tests {
         )
         .unwrap();
 
-        let mut cache = SourceMessageCache::load();
-        assert!(cache.get(current_identity, source.path()).is_none());
+        // The scan performs the repair. Parsing and re-inserting here instead
+        // would prove the test can rebuild a cache, not that the application
+        // does -- which is the whole claim under test.
+        let scanned = scan_dsh(source_home.path());
+        assert_eq!(scanned.len(), 1);
         assert_eq!(
-            SourceFingerprint::from_path(source.path()).unwrap(),
-            fingerprint
+            scanned[0].model_id, "glm-5.3",
+            "usage must land on the model the provider served, not the one requested"
+        );
+        assert_ne!(scanned[0].tokens.input, 999);
+        assert_eq!(
+            SourceFingerprint::from_path(&source).unwrap(),
+            fingerprint,
+            "parser-version invalidation must not require a source rewrite"
         );
 
-        let rebuilt = crate::sessions::dsh::parse_dsh_file(source.path());
-        assert_eq!(rebuilt.len(), 1);
-        assert_eq!(rebuilt[0].model_id, "glm-5.3");
-        assert_ne!(rebuilt[0].tokens.input, 999);
-        cache.insert(CachedSourceEntry::new(
-            current_identity,
-            source.path(),
-            fingerprint,
-            rebuilt.clone(),
-            Vec::new(),
-            None,
-        ));
-        cache.save_if_dirty();
+        let persisted = SourceMessageCache::load();
+        let cached = persisted
+            .get(current_identity, &source)
+            .expect("the scan must persist the entry it reparsed");
+        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.messages.len(), 1);
+        assert_eq!(cached.messages[0].model_id, "glm-5.3");
 
-        let warm = SourceMessageCache::load();
-        let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 5);
-        assert_eq!(cached.messages, rebuilt);
+        let warm = scan_dsh(source_home.path());
+        assert_eq!(
+            dsh_report_json(&warm),
+            dsh_report_json(&scanned),
+            "the warm scan must agree with the cold one that rebuilt the cache"
+        );
+        assert_eq!(warm[0].model_id, "glm-5.3");
     }
 
     #[test]
@@ -3635,18 +5299,22 @@ mod tests {
     fn dsh_v4_shards_are_reparsed_with_global_compaction_identity() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
-        let source = write_temp_file(
+        let source_home = TempDir::new().unwrap();
+        let source = write_dsh_transcript(
+            source_home.path(),
+            "session-summary",
             br#"{"type":"session","id":"session-summary","createdAt":1,"cwd":"/work"}
 {"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-global","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 5);
+        assert_eq!(current_identity.parser_version, 7);
+        // Pinned at 4, the identity 4.15.0 cached under; see the v3 test.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 4,
         };
-        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
         let mut stale_message = UnifiedMessage::new(
             current_identity.namespace,
             "m",
@@ -3658,6 +5326,7 @@ mod tests {
                 output: 20,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -3666,13 +5335,13 @@ mod tests {
             Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0".to_string());
         let stale_entry = CachedSourceEntry::new(
             stale_identity,
-            source.path(),
+            &source,
             fingerprint.clone(),
             vec![stale_message],
             Vec::new(),
             None,
         );
-        let stale_path = cache_shard_path(current_identity, source.path());
+        let stale_path = cache_shard_path(current_identity, &source);
         ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
         write_shard_with_limit(
             &stale_path,
@@ -3682,37 +5351,358 @@ mod tests {
         )
         .unwrap();
 
-        let mut cache = SourceMessageCache::load();
-        assert!(
-            cache.get(current_identity, source.path()).is_none(),
+        let scanned = scan_dsh(source_home.path());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-global:1786669450002:p:m:10:20:0:0:0"),
             "a released v4 seq-keyed row must not survive the parser change"
         );
-
-        let rebuilt = crate::sessions::dsh::parse_dsh_file(source.path());
-        assert_eq!(rebuilt.len(), 1);
         assert_eq!(
-            rebuilt[0].dedup_key.as_deref(),
-            Some("dsh:summary:cmp:compact-global:1786669450002:p:m:10:20:0:0:0")
-        );
-        cache.insert(CachedSourceEntry::new(
-            current_identity,
-            source.path(),
+            SourceFingerprint::from_path(&source).unwrap(),
             fingerprint,
-            rebuilt.clone(),
-            Vec::new(),
-            None,
-        ));
+            "parser-version invalidation must not require a source rewrite"
+        );
+
+        let persisted = SourceMessageCache::load();
+        let cached = persisted
+            .get(current_identity, &source)
+            .expect("the scan must persist the entry it reparsed");
+        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.messages, scanned);
+
+        let warm = scan_dsh(source_home.path());
+        assert_eq!(warm, scanned);
+    }
+
+    /// The comparison the released-binary gate existed for, run in process.
+    ///
+    /// Each fixture's `expected.json` freezes two figures: what the current
+    /// parser reports, and what a published predecessor reported (4.14.0 for
+    /// served-model attribution, 4.15.0 for compactionId keying). The
+    /// predecessor's half is evidence about an implementation this tree no
+    /// longer contains, which is what made it worth recording -- a scan that
+    /// served a predecessor's cache rows would report the predecessor's figure,
+    /// and the two differ in exactly the way each fixture was built to expose.
+    ///
+    /// Seeding the rows is the part that used to need the second binary on
+    /// disk. What it cannot reproduce is that binary's per-file row layout, so
+    /// the seeded rows are markers instead: a report carrying one is a report
+    /// served from a retired cache, which is the failure being graded.
+    ///
+    /// This is also the assertion that fails on the *next* DSH parser change
+    /// shipped without a version bump. Both halves of a same-version round trip
+    /// would move together and stay green; `expected.json` does not move unless
+    /// someone edits it, so a semantics change lands as a diff against the
+    /// frozen figure. Refreshing that figure is the deliberate act of
+    /// re-recording a baseline, not a snapshot update.
+    #[test]
+    #[serial_test::serial]
+    fn dsh_predecessor_caches_are_rejected_and_rebuilt_by_the_production_scan() {
+        // Pinned, not derived from the running version: these are the two
+        // identities DSH actually shipped. A bump to 6 must leave them at 3 and
+        // 4 rather than silently following it and grading nothing.
+        for (fixture, predecessor_version) in [("dsh-served-model", 3u32), ("dsh-seq-key", 4)] {
+            let temp_home = TempDir::new().unwrap();
+            let _cache_env = sandbox_cache_env(temp_home.path());
+            let source_home = TempDir::new().unwrap();
+            let transcripts = install_dsh_fixture(source_home.path(), fixture);
+            let expected = dsh_fixture_expectations(fixture);
+            let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+
+            let pinned_key = predecessor_version.to_string();
+            assert!(
+                current_identity.parser_version > predecessor_version,
+                "{fixture}: the pinned predecessor must stay behind the running parser"
+            );
+            let recorded: Vec<&String> = expected["predecessors"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(
+                recorded,
+                vec![&pinned_key],
+                "{fixture}: expected.json must record exactly the pinned predecessor"
+            );
+            assert_ne!(
+                expected["predecessors"][pinned_key.as_str()],
+                expected["current"],
+                "{fixture}: a baseline that reports what the current parser reports cannot \
+                 grade the change it was recorded for"
+            );
+
+            seed_dsh_cache_at_version(&transcripts, predecessor_version);
+
+            let rebuilt = scan_dsh(source_home.path());
+            assert_eq!(
+                dsh_report_json(&rebuilt),
+                expected["current"],
+                "{fixture}: a cache the predecessor wrote must be reparsed, not served"
+            );
+            assert!(
+                !report_carries_the_cache_marker(&rebuilt),
+                "{fixture}: a row from the retired cache reached the report"
+            );
+
+            // The repair has to land on disk, not just in this scan's memory:
+            // an upgrading user runs the binary once and the next run is warm.
+            let persisted = SourceMessageCache::load();
+            for path in &transcripts {
+                let entry = persisted
+                    .get(current_identity, path)
+                    .unwrap_or_else(|| panic!("{fixture}: {} was not re-cached", path.display()));
+                assert_eq!(
+                    entry.parser_version, current_identity.parser_version,
+                    "{fixture}: the rebuilt entry must carry the running identity"
+                );
+                assert!(!report_carries_the_cache_marker(&entry.messages));
+            }
+
+            let warm = scan_dsh(source_home.path());
+            assert_eq!(
+                dsh_report_json(&warm),
+                expected["current"],
+                "{fixture}: the warm scan after a migration must agree with the cold one"
+            );
+        }
+    }
+
+    /// The half of the gate the predecessor test cannot cover: a cache this
+    /// build wrote, under the identity this build runs, must be *served*.
+    /// Rejecting a retired identity and discarding every valid entry look
+    /// identical from a report alone, and the second is a full reparse on every
+    /// run.
+    ///
+    /// Inferring this from a binary's stdout took the shell gate a canary
+    /// transcript planted outside the fingerprint's sample windows and edited
+    /// in place after the release cached it. In process the cached rows are
+    /// directly editable, so the proof is a row no transcript contains.
+    #[test]
+    #[serial_test::serial]
+    fn dsh_cache_rows_are_served_while_the_parser_identity_matches() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let transcripts = install_dsh_fixture(source_home.path(), "dsh-seq-key");
+        let identity = CacheIdentity::for_client(ClientId::Dsh);
+
+        let cold = scan_dsh(source_home.path());
+        assert!(!cold.is_empty(), "the fixture must parse");
+        assert!(!report_carries_the_cache_marker(&cold));
+
+        // Same identity, same fingerprints, different payloads: the only route
+        // into the next report is the cache.
+        let mut cache = SourceMessageCache::load();
+        for path in &transcripts {
+            let entry = cache
+                .get(identity, path)
+                .unwrap_or_else(|| panic!("{} was not cached by the cold scan", path.display()));
+            cache.insert(CachedSourceEntry::new(
+                identity,
+                path,
+                entry.fingerprint.clone(),
+                vec![cache_only_marker_row()],
+                Vec::new(),
+                None,
+            ));
+        }
         cache.save_if_dirty();
 
-        let warm = SourceMessageCache::load();
-        let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 5);
-        assert_eq!(cached.messages, rebuilt);
+        let warm = scan_dsh(source_home.path());
+        assert!(
+            report_carries_the_cache_marker(&warm),
+            "a cache written under the running parser identity must be served, not reparsed"
+        );
+        assert_eq!(
+            warm.iter()
+                .filter(|message| message.session_id.contains(DSH_CACHE_MARKER))
+                .count(),
+            transcripts.len(),
+            "every cached transcript must be served from the cache"
+        );
+    }
+
+    /// One cache, two shards, opposite identities, loaded together.
+    ///
+    /// [`dsh_predecessor_caches_are_rejected_and_rebuilt_by_the_production_scan`]
+    /// seeds every transcript at one predecessor version per run, so the cache
+    /// under test is uniform: every shard is stale, and the totals it grades
+    /// are the sum of shards that all took the same path. A load or rewrite bug
+    /// that mishandles *one* stale shard while the rest are current has nothing
+    /// failing it there -- the current shards pad the aggregate back to
+    /// plausible. This pairs the two states in a single load and grades each
+    /// shard on its own outcome rather than on the total they add to.
+    ///
+    /// The stale side is the `dsh-seq-key` fixture seeded at parser version 6,
+    /// the immediate predecessor of the running generation (Dsh was bumped
+    /// 5 -> 7 by the embedded-attempt accounting fix, so its newest retired
+    /// identity is 6): reparsing it has a known-correct answer
+    /// (its `current` figures) that differs from what a served predecessor row
+    /// would report, so a shard that is wrongly served is caught by the number,
+    /// not just by the marker. The current side is a served canary: a fixture's
+    /// own shard cannot be pinned under a random temp root, and this side only
+    /// has to prove "a valid shard is served, not reparsed", so it is a
+    /// transcript placed in a shard searched to be disjoint from the stale ones
+    /// -- which also makes the two seedings write separate shard files instead
+    /// of one clobbering the other.
+    ///
+    /// Per-shard markers carry a label, so a bug that serves the stale shard
+    /// surfaces the `stale` marker specifically while the intended service of
+    /// the current shard surfaces the `served` one; the two are told apart
+    /// rather than merged. The assertions cover both the report and the cache
+    /// left on disk: the stale shard must be absent from the report, reparsed
+    /// to the current figures, and its entry rewritten to the running identity;
+    /// the current shard must be served, its entry left under the running
+    /// identity. The last of those is the one a fresh parse cannot fake -- a
+    /// rewrite-path regression that reparses correctly but never persists would
+    /// pass every report assertion and fail only here.
+    #[test]
+    #[serial_test::serial]
+    fn dsh_mixed_stale_and_current_shards_are_each_handled_on_their_own_identity() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+
+        // The stale side: a real fixture whose reparse answer is recorded, so a
+        // served shard is caught by a wrong figure and not only by the marker.
+        let stale_transcripts = install_dsh_fixture(source_home.path(), "dsh-seq-key");
+        let expected = dsh_fixture_expectations("dsh-seq-key");
+
+        // The current side: a transcript in a shard none of the stale
+        // transcripts occupy. Shard identity is version-independent (it hashes
+        // the namespace and path, not the parser version), so a shard chosen
+        // disjoint here stays disjoint after the stale side is reparsed.
+        let stale_shards: HashSet<CacheShardKey> = stale_transcripts
+            .iter()
+            .map(|path| CacheKey::new(current_identity, path).shard())
+            .collect();
+        let served_path = (0..CACHE_SHARD_COUNT * 4)
+            .map(|index| {
+                source_home
+                    .path()
+                    .join(".dsh")
+                    .join("sessions")
+                    .join("--served--")
+                    .join(format!("canary-{index}"))
+                    .join("session.jsonl")
+            })
+            .find(|candidate| {
+                !stale_shards.contains(&CacheKey::new(current_identity, candidate).shard())
+            })
+            .expect("a served shard distinct from every stale shard");
+        std::fs::create_dir_all(served_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &served_path,
+            br#"{"type":"session","id":"canary","createdAt":1,"cwd":"/work"}
+{"type":"assistant/message","seq":1,"time":1787000000000,"data":{"turn":1,"message":{"id":"m-canary","source":{"kind":"model","provider":"canary-provider","model":"canary-model"}},"usage":{"inputTokens":1,"outputTokens":1}}}
+"#,
+        )
+        .unwrap();
+
+        seed_dsh_shards_at_version(&stale_transcripts, 6, named_marker_row("stale"));
+        seed_dsh_shards_at_version(
+            std::slice::from_ref(&served_path),
+            current_identity.parser_version,
+            named_marker_row("served"),
+        );
+
+        let report = scan_dsh(source_home.path());
+
+        // The stale shard: reparsed, so its marker never reaches the report.
+        assert!(
+            !report_carries_marker_labelled(&report, "stale"),
+            "the stale shard was served rather than reparsed"
+        );
+        // The current shard: served, so its marker does.
+        assert!(
+            report_carries_marker_labelled(&report, "served"),
+            "the current shard was reparsed rather than served"
+        );
+
+        // The reparsed stale shard reports the current figures, not the
+        // predecessor's -- the correctness the marker alone cannot show. The
+        // served marker row is the only non-fixture row, so dropping it leaves
+        // exactly what the stale side reparsed to.
+        let reparsed_only: Vec<UnifiedMessage> = report
+            .iter()
+            .filter(|message| {
+                !report_carries_marker_labelled(std::slice::from_ref(*message), "served")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            dsh_report_json(&reparsed_only),
+            expected["current"],
+            "the reparsed stale shard must report the current figures, not the predecessor's"
+        );
+
+        // The totals are the two shards added: the stale side's reparsed
+        // current figures plus the one served marker row. A stale shard served
+        // instead of reparsed, or a current shard reparsed instead of served,
+        // moves this sum.
+        let marker = named_marker_row("served");
+        let seq = &expected["current"]["totals"];
+        let grand = &dsh_report_json(&report)["totals"];
+        assert_eq!(
+            grand["totalInput"].as_i64().unwrap(),
+            seq["totalInput"].as_i64().unwrap() + marker.tokens.input,
+        );
+        assert_eq!(
+            grand["totalOutput"].as_i64().unwrap(),
+            seq["totalOutput"].as_i64().unwrap() + marker.tokens.output,
+        );
+        assert_eq!(
+            grand["totalCacheRead"].as_i64().unwrap(),
+            seq["totalCacheRead"].as_i64().unwrap() + marker.tokens.cache_read,
+        );
+        assert_eq!(
+            grand["totalCacheWrite"].as_i64().unwrap(),
+            seq["totalCacheWrite"].as_i64().unwrap() + marker.tokens.cache_write,
+        );
+
+        // The repair is persisted, not just reflected in this scan. Every stale
+        // transcript's entry must now carry the running identity with its
+        // marker gone -- the assertion a correct reparse that never rewrote the
+        // shard would fail while passing every report check above.
+        let persisted = SourceMessageCache::load();
+        for path in &stale_transcripts {
+            let entry = persisted
+                .get(current_identity, path)
+                .unwrap_or_else(|| panic!("{} was not re-cached", path.display()));
+            assert_eq!(
+                entry.parser_version, current_identity.parser_version,
+                "the rebuilt stale entry must carry the running identity"
+            );
+            assert!(
+                !report_carries_marker_labelled(&entry.messages, "stale"),
+                "the stale shard's cache entry still carries its marker after the scan"
+            );
+        }
+
+        // The served shard was left as it was: still the running identity,
+        // still the marker. Rewriting a shard whose identity already matched
+        // would be a needless reparse this asserts against.
+        let served_entry = persisted
+            .get(current_identity, &served_path)
+            .expect("the served transcript is missing from the cache");
+        assert_eq!(served_entry.parser_version, current_identity.parser_version);
+        assert!(
+            report_carries_marker_labelled(&served_entry.messages, "served"),
+            "the served shard's cache entry was rewritten though its identity matched"
+        );
     }
 
     #[test]
     fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
-        assert_eq!(parser_version(ClientId::MiMoCode), 3);
+        assert_eq!(parser_version(ClientId::MiMoCode), 6);
+        assert_eq!(parser_version(ClientId::MiMoDesktop), 6);
+    }
+
+    #[test]
+    fn test_muse_parser_version_invalidates_stale_provider_metadata_after_reset() {
+        assert_eq!(parser_version(ClientId::Muse), 3);
     }
 
     #[test]
@@ -3723,6 +5713,167 @@ mod tests {
     #[test]
     fn test_junie_parser_version_invalidates_rows_without_cost_provenance() {
         assert_eq!(parser_version(ClientId::Junie), 3);
+    }
+
+    #[test]
+    fn test_parser_version_covers_every_client() {
+        // Exhaustiveness itself is compile-enforced by the explicit arms in
+        // `parser_version()`; this pins the second half of the contract,
+        // that every arm's version is a usable one.
+        for client in ClientId::ALL {
+            assert!(
+                parser_version(client) >= 1,
+                "{client:?} needs an explicit parser_version >= 1"
+            );
+        }
+    }
+
+    /// The roster is the single source of truth for shared-parser
+    /// versioning: `parser_version()` reads every member's version from its
+    /// family's base through `shared_family_version`, so the facts that
+    /// cannot be derived from the code itself are the membership and the
+    /// offsets. This pins them exactly. Removing a member, dropping a
+    /// family, or re-versioning a member with a bare literal in
+    /// `parser_version()` fails here; removing a roster entry without
+    /// reclassifying the client panics in `parser_version()` itself.
+    #[test]
+    fn test_shared_parser_family_roster_pins_exact_membership() {
+        let expected: &[(&str, &[(ClientId, u32)])] = &[
+            (
+                "antigravity generation database",
+                &[
+                    (ClientId::AntigravityCli, 0),
+                    (ClientId::AntigravityExtension, 0),
+                ],
+            ),
+            (
+                "pi-format",
+                &[
+                    (ClientId::Pi, 2),
+                    (ClientId::Kimchi, 1),
+                    (ClientId::Omp, 1),
+                    (ClientId::Senpi, 1),
+                    (ClientId::PrimeAgent, 4),
+                ],
+            ),
+            (
+                "roo/kilo task log",
+                &[
+                    (ClientId::RooCode, 0),
+                    (ClientId::KiloCode, 0),
+                    (ClientId::Cline, 2),
+                ],
+            ),
+            (
+                "opencode schema",
+                &[
+                    (ClientId::OpenCode, 2),
+                    (ClientId::MiMoCode, 5),
+                    (ClientId::MiMoDesktop, 5),
+                    (ClientId::Kilo, 0),
+                ],
+            ),
+            (
+                "tencent buddy",
+                &[(ClientId::CodeBuddy, 0), (ClientId::WorkBuddy, 0)],
+            ),
+            (
+                "codebuff chat",
+                &[(ClientId::Codebuff, 0), (ClientId::Freebuff, 0)],
+            ),
+        ];
+        let expected: Vec<(&str, Vec<(ClientId, u32)>)> = expected
+            .iter()
+            .map(|(name, members)| (*name, members.to_vec()))
+            .collect();
+        let actual: Vec<(&str, Vec<(ClientId, u32)>)> = SHARED_PARSER_FAMILIES
+            .iter()
+            .map(|family| (family.name, family.members.to_vec()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "SHARED_PARSER_FAMILIES membership or offsets drifted from the pinned roster"
+        );
+    }
+
+    #[test]
+    fn test_shared_parser_family_roster_is_accurate() {
+        for family in SHARED_PARSER_FAMILIES {
+            // A one-client "family" is an independent parser and belongs
+            // outside this table.
+            assert!(
+                family.members.len() >= 2,
+                "the {} family needs at least two members",
+                family.name
+            );
+            for (index, (client, _)) in family.members.iter().enumerate() {
+                assert!(
+                    ClientId::ALL.contains(client),
+                    "{client:?} is declared in the {} family but missing from ClientId::ALL",
+                    family.name
+                );
+                assert!(
+                    !family.members[..index]
+                        .iter()
+                        .any(|(earlier, _)| earlier == client),
+                    "{client:?} is listed twice inside the {} family",
+                    family.name
+                );
+            }
+        }
+
+        // A client may appear in only one family: a single parser_version
+        // cannot track two shared bases at once.
+        let mut seen: Vec<ClientId> = Vec::new();
+        for family in SHARED_PARSER_FAMILIES {
+            for (client, _) in family.members {
+                assert!(
+                    !seen.contains(client),
+                    "{client:?} appears in two shared-parser families"
+                );
+                seen.push(*client);
+            }
+        }
+    }
+
+    /// The bisection behind roster completeness: every client is either in
+    /// exactly one shared family -- versioned from that family's base by
+    /// construction -- or independent, with an explicit arm in
+    /// `parser_version()`. A client can never go unclassified, because the
+    /// exhaustive match fails compilation until a new `ClientId` is either
+    /// rostered or given its own arm. A client wired to a shared driver
+    /// but given a bare literal anyway lands on the independent side here,
+    /// where the edit stays reviewable; cache identities are namespaced by
+    /// client (`CacheIdentity`), so an independent integer coinciding with
+    /// a family's version is harmless and deliberately not flagged.
+    #[test]
+    fn test_every_client_is_rostered_once_or_versioned_independently() {
+        let mut rostered = 0usize;
+        let mut independent = 0usize;
+        for client in ClientId::ALL {
+            let families: Vec<&str> = SHARED_PARSER_FAMILIES
+                .iter()
+                .filter(|family| family.members.iter().any(|(member, _)| *member == client))
+                .map(|family| family.name)
+                .collect();
+            match families.as_slice() {
+                [] => independent += 1,
+                [_] => rostered += 1,
+                _ => panic!("{client:?} appears in multiple shared-parser families ({families:?})"),
+            }
+        }
+        assert_eq!(
+            rostered,
+            SHARED_PARSER_FAMILIES
+                .iter()
+                .map(|family| family.members.len())
+                .sum::<usize>(),
+            "every rostered client must classify exactly once"
+        );
+        assert!(
+            independent > 0,
+            "sanity: most clients own an independent parser"
+        );
     }
 
     #[test]
@@ -4225,6 +6376,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -4581,6 +6733,617 @@ mod tests {
         assert!(!codex_prefix_matches(file.path(), &incremental_cache));
     }
 
+    fn micode_test_metadata() -> crate::sessions::micode::MiMoRowMetadata {
+        crate::sessions::micode::MiMoRowMetadata {
+            session_created_bits: Some(1_780_000_000_000.0f64.to_bits()),
+            row: crate::sessions::opencode_schema::OpenCodeRowMetadata {
+                created_bits: 1_780_000_000_000.125f64.to_bits(),
+                completed_bits: Some(1_780_000_000_050.625f64.to_bits()),
+                has_embedded_id: true,
+            },
+        }
+    }
+
+    #[test]
+    fn test_micode_metadata_keeps_exact_current_entry_bytes() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = test_entry(identity, source.path(), "session")
+            .with_micode_metadata(vec![micode_test_metadata()]);
+        // Bincode struct fields are positional. This tuple is the exact
+        // current entry layout, proving the serde-skipped in-memory
+        // micode_metadata field contributes no bytes to the payload.
+        let current = (
+            &entry.parser_namespace,
+            entry.parser_version,
+            &entry.path,
+            &entry.fingerprint,
+            &entry.messages,
+            &entry.fallback_timestamp_indices,
+            &entry.codex_incremental,
+            &entry.prime_accounting,
+            &entry.opencode_incremental,
+        );
+        let bytes = bincode::options().serialize(&entry).unwrap();
+        assert_eq!(bytes, bincode::options().serialize(&current).unwrap());
+        let decoded: CachedSourceEntry = bincode::options().deserialize(&bytes).unwrap();
+        assert!(decoded.micode_metadata.is_none());
+        assert_eq!(decoded.messages[0].session_id, "session");
+    }
+
+    #[test]
+    fn test_micode_envelope_roundtrip_and_take_payload_keep_exact_provenance() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let mut entry = test_entry(identity, source.path(), "session")
+            .with_micode_metadata(vec![micode_test_metadata()]);
+        let taken = entry.take_payload();
+        assert!(entry.messages.is_empty());
+        assert!(entry.micode_metadata.is_none());
+        assert!(taken.has_valid_micode_metadata());
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shard.bin");
+        write_shard_with_limit(&path, identity, &[taken], MAX_CACHE_SHARD_BYTES).unwrap();
+        let envelope: CachedShardEnvelope = bincode::options()
+            .deserialize_from(BufReader::new(File::open(&path).unwrap()))
+            .unwrap();
+        assert_eq!(envelope.format_version, MICODE_CACHE_FORMAT_VERSION);
+        match read_shard(&path, identity) {
+            ShardReadStatus::Loaded(entries) => {
+                assert!(entries[0].has_valid_micode_metadata());
+                assert_eq!(
+                    entries[0].micode_metadata.as_deref(),
+                    Some([micode_test_metadata()].as_slice())
+                );
+            }
+            _ => panic!("unexpected MiMo cache result"),
+        }
+    }
+
+    /// A shard the previous release wrote for MiMo: envelope version 8, nested
+    /// entry in the version-7 layout, because `parent_session_id` postdates
+    /// both. Reading it must migrate the messages and keep the provenance
+    /// beside them instead of reporting an intact cache as corrupt.
+    #[test]
+    fn test_released_micode_envelope_migrates_with_its_provenance() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let entry = test_entry(identity, source.path(), "released-mimo");
+        let legacy_entry = LegacyCachedSourceEntryV7 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry
+                .messages
+                .into_iter()
+                .map(LegacyUnifiedMessageV7::from)
+                .collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        };
+        let metadata = vec![micode_test_metadata()];
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_MICODE_CACHE_FORMAT_VERSION_V8,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(legacy_entry, Some(metadata.clone()))])
+                .unwrap(),
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("released-micode.bin");
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "released-mimo"
+                    && entries[0].messages[0].parent_session_id.is_none()
+                    && entries[0].micode_metadata.as_deref() == Some(metadata.as_slice())
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_micode_drained_clean_payload_survives_dirty_sibling_shard_save() {
+        let cache_home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(cache_home.path());
+        let source_home = TempDir::new().unwrap();
+        let first = source_home.path().join("first.db");
+        std::fs::write(&first, b"first").unwrap();
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let shard = CacheKey::new(identity, &first).shard();
+        let second = (0..10000)
+            .map(|i| source_home.path().join(format!("sibling-{i}.db")))
+            .find(|path| CacheKey::new(identity, path).shard() == shard)
+            .unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut initial = SourceMessageCache::load();
+        for (path, id) in [(&first, "first"), (&second, "second")] {
+            initial.insert(
+                test_entry(identity, path, id).with_micode_metadata(vec![micode_test_metadata()]),
+            );
+        }
+        initial.save_if_dirty();
+        let mut next = SourceMessageCache::load();
+        let untouched = next.take(identity, &first).unwrap();
+        assert!(untouched.has_valid_micode_metadata());
+        assert!(next.entry_messages_released(identity, &first));
+        std::fs::write(&second, b"second changed").unwrap();
+        next.insert(
+            test_entry(identity, &second, "changed")
+                .with_micode_metadata(vec![micode_test_metadata()]),
+        );
+        next.save_if_dirty();
+        let reloaded = SourceMessageCache::load();
+        let first_again = reloaded.take(identity, &first).unwrap();
+        let second_again = reloaded.take(identity, &second).unwrap();
+        assert!(first_again.has_valid_micode_metadata());
+        assert!(second_again.has_valid_micode_metadata());
+        assert_eq!(first_again.messages[0].session_id, "first");
+        assert_eq!(second_again.messages[0].session_id, "changed");
+    }
+
+    #[test]
+    fn test_micode_envelope_rejects_wrong_namespace_and_invalid_metadata() {
+        let source = write_temp_file(b"{}\n");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shard.bin");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        for metadata in [
+            vec![],
+            vec![crate::sessions::micode::MiMoRowMetadata {
+                session_created_bits: Some(f64::NAN.to_bits()),
+                ..micode_test_metadata()
+            }],
+        ] {
+            let entry =
+                test_entry(identity, source.path(), "session").with_micode_metadata(metadata);
+            write_shard_with_limit(&path, identity, &[entry], MAX_CACHE_SHARD_BYTES).unwrap();
+            assert!(
+                matches!(read_shard(&path,identity),ShardReadStatus::Loaded(entries) if entries[0].micode_metadata.is_none())
+            );
+        }
+        let old_micode_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: vec![0xff, 0xff],
+        };
+        std::fs::write(
+            &path,
+            bincode::options().serialize(&old_micode_envelope).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Invalid(_)
+        ));
+
+        let unrelated = CacheIdentity::for_client(ClientId::Claude);
+        let entry = test_entry(unrelated, source.path(), "retained-claude");
+        write_shard_with_limit(&path, unrelated, &[entry], MAX_CACHE_SHARD_BYTES).unwrap();
+        let mut envelope: CachedShardEnvelope = bincode::options()
+            .deserialize_from(BufReader::new(File::open(&path).unwrap()))
+            .unwrap();
+        assert_eq!(envelope.format_version, CACHE_FORMAT_VERSION);
+        envelope.format_version = MICODE_CACHE_FORMAT_VERSION;
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, unrelated),
+            ShardReadStatus::Stale
+        ));
+        envelope.parser_namespace = identity.namespace.to_string();
+        envelope.parser_version = identity.parser_version;
+        envelope.payload = vec![0xff, 0xff];
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_old_micode_v8_layout_migrates_messages_and_row_provenance() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let entry = legacy_v7_entry(test_entry(identity, source.path(), "legacy"));
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_MICODE_CACHE_FORMAT_VERSION_V8,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(entry, Some(vec![micode_test_metadata()]))])
+                .unwrap(),
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bin");
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "legacy"
+                    && entries[0].messages[0].service_tier.is_none()
+                    && entries[0].has_valid_micode_metadata()
+        ));
+    }
+
+    #[test]
+    fn test_old_micode_v9_layout_migrates_messages_and_row_provenance() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let entry = legacy_v8_entry(test_entry(identity, source.path(), "legacy"));
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_MICODE_CACHE_FORMAT_VERSION_V9,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(entry, Some(vec![micode_test_metadata()]))])
+                .unwrap(),
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bin");
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "legacy"
+                    && entries[0].messages[0].tokens.cache_write_1h == 0
+                    && entries[0].has_valid_micode_metadata()
+        ));
+    }
+
+    #[test]
+    fn test_old_micode_v10_layout_migrates_messages_and_row_provenance() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let entry = legacy_v9_entry(test_entry(identity, source.path(), "legacy"));
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_MICODE_CACHE_FORMAT_VERSION_V10,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(entry, Some(vec![micode_test_metadata()]))])
+                .unwrap(),
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bin");
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "legacy"
+                    && entries[0].messages[0].parent_session_id.is_none()
+                    && entries[0].has_valid_micode_metadata()
+        ));
+    }
+
+    fn run_shard_migration_preserves_claude_compacted_history(
+        cache_write: i64,
+        cache_write_1h: i64,
+        service_tier: Option<&str>,
+        format_version: u32,
+        strip_retention_provenance: bool,
+        serialize_legacy_entries: impl FnOnce(CachedSourceEntry) -> Vec<u8>,
+        assert_version_specific: impl FnOnce(&CachedSourceEntry),
+    ) {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"live transcript no longer contains compacted turn\n");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut entry = test_entry(identity, source.path(), "live-turn");
+        let mut retained = UnifiedMessage::new(
+            identity.namespace,
+            "claude-sonnet-4",
+            "anthropic",
+            "compacted-turn-only-in-cache",
+            2,
+            TokenBreakdown {
+                input: 11,
+                output: 7,
+                cache_read: 3,
+                cache_write,
+                cache_write_1h,
+                ..Default::default()
+            },
+            0.25,
+        );
+        retained.service_tier = service_tier.map(str::to_string);
+        entry.messages.push(retained);
+        entry.messages[1].dedup_key = Some("uuid:retained-assistant-turn".to_string());
+        entry.fallback_timestamp_indices = vec![1, CLAUDE_RETENTION_PROVENANCE_MARKER];
+        let payload = serialize_legacy_entries(entry);
+        let key = CacheKey::new(identity, source.path());
+        let shard_key = key.shard();
+        let shard_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(shard_path.parent().unwrap()).unwrap();
+        let envelope = CachedShardEnvelope {
+            format_version,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload,
+        };
+        std::fs::write(
+            &shard_path,
+            bincode::options().serialize(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        let migrated = cache.get(identity, source.path()).unwrap();
+        assert_eq!(migrated.messages.len(), 2);
+        assert_eq!(
+            migrated.messages[1].session_id,
+            "compacted-turn-only-in-cache"
+        );
+        assert_eq!(
+            migrated.messages[1].dedup_key.as_deref(),
+            Some("uuid:retained-assistant-turn")
+        );
+        assert_version_specific(&migrated);
+        if strip_retention_provenance {
+            assert_eq!(migrated.fallback_timestamp_indices, vec![1]);
+            assert!(migrated.needs_retention_provenance_migration());
+        } else {
+            assert_eq!(
+                migrated.fallback_timestamp_indices,
+                vec![1, CLAUDE_RETENTION_PROVENANCE_MARKER]
+            );
+            assert!(!migrated.needs_retention_provenance_migration());
+        }
+        assert!(cache.has_rewrite_shard(&shard_key));
+        cache.save_if_dirty();
+        assert!(matches!(
+            read_shard(&shard_path, identity),
+            ShardReadStatus::Loaded(entries)
+                if entries.len() == 1
+                    && entries[0].messages.len() == 2
+                    && entries[0].messages[1].session_id == "compacted-turn-only-in-cache"
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v7_shard_migration_preserves_claude_compacted_history() {
+        run_shard_migration_preserves_claude_compacted_history(
+            0,
+            0,
+            None,
+            LEGACY_CACHE_FORMAT_VERSION_V7,
+            true,
+            |entry| {
+                bincode::options()
+                    .serialize(&vec![legacy_v7_entry(entry)])
+                    .unwrap()
+            },
+            |migrated| {
+                assert!(migrated.messages[1].service_tier.is_none());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v8_shard_migration_preserves_claude_compacted_history() {
+        run_shard_migration_preserves_claude_compacted_history(
+            100,
+            0,
+            Some("priority"),
+            LEGACY_CACHE_FORMAT_VERSION_V8,
+            true,
+            |entry| {
+                bincode::options()
+                    .serialize(&vec![legacy_v8_entry(entry)])
+                    .unwrap()
+            },
+            |migrated| {
+                assert_eq!(
+                    migrated.messages[1].service_tier.as_deref(),
+                    Some("priority")
+                );
+                assert_eq!(migrated.messages[1].tokens.cache_write, 100);
+                assert_eq!(migrated.messages[1].tokens.cache_write_1h, 0);
+            },
+        );
+    }
+
+    /// Version 9 is the format the previous release wrote: it already carries
+    /// the 1-hour split, so its Claude entries migrate with their retention
+    /// provenance intact and pay no reparse.
+    #[test]
+    #[serial_test::serial]
+    fn test_v9_shard_migration_keeps_cache_write_1h_and_retention_provenance() {
+        run_shard_migration_preserves_claude_compacted_history(
+            100,
+            25,
+            Some("priority"),
+            LEGACY_CACHE_FORMAT_VERSION_V9,
+            false,
+            |entry| {
+                bincode::options()
+                    .serialize(&vec![legacy_v9_entry(entry)])
+                    .unwrap()
+            },
+            |migrated| {
+                assert_eq!(
+                    migrated.messages[1].service_tier.as_deref(),
+                    Some("priority")
+                );
+                assert_eq!(migrated.messages[1].tokens.cache_write, 100);
+                assert_eq!(migrated.messages[1].tokens.cache_write_1h, 25);
+                assert!(migrated.messages[1].parent_session_id.is_none());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v6_shard_migration_strips_retention_provenance_marker() {
+        run_shard_migration_preserves_claude_compacted_history(
+            0,
+            0,
+            None,
+            LEGACY_CACHE_FORMAT_VERSION_V6,
+            true,
+            |entry| {
+                bincode::options()
+                    .serialize(&vec![legacy_v6_entry(entry)])
+                    .unwrap()
+            },
+            |migrated| {
+                assert!(migrated.messages[1].service_tier.is_none());
+            },
+        );
+    }
+
+    fn run_stale_v8_shard_is_reparsed_with_cache_write_1h(
+        client: ClientId,
+        scan_client_name: &str,
+        stored_parser_version_override: Option<u32>,
+        check_cold_entry_provenance: bool,
+        reparse_reason: &str,
+    ) {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+
+        let client_dir = PathBuf::from(
+            client
+                .data()
+                .resolve_path_with_env_strategy(&temp_home.path().to_string_lossy(), false),
+        )
+        .join("myproject");
+        std::fs::create_dir_all(&client_dir).unwrap();
+        let transcript = client_dir.join("session-1h.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{\"type\":\"assistant\",\"timestamp\":\"2024-12-01T10:00:00.000Z\",\"requestId\":\"req_001\",\"message\":{\"id\":\"msg_001\",\"model\":\"claude-3-5-sonnet\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_creation_input_tokens\":100000,\"cache_creation\":{\"ephemeral_1h_input_tokens\":100000}}}}\n",
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(client);
+        let scan_client_names = [scan_client_name.to_string()];
+        let scan = || {
+            crate::parse_all_messages_with_pricing_with_env_strategy(
+                &temp_home.path().to_string_lossy(),
+                &scan_client_names,
+                None,
+                false,
+                &crate::scanner::ScannerSettings::default(),
+            )
+        };
+
+        let cold = scan();
+        assert_eq!(cold.len(), 1, "the transcript must parse to one message");
+        assert_eq!(cold[0].tokens.cache_write_1h, 100000);
+
+        let cache = SourceMessageCache::load();
+        let mut entries: Vec<CachedSourceEntry> = cache
+            .all_entries()
+            .into_iter()
+            .filter(|entry| entry.parser_namespace == identity.namespace)
+            .collect();
+        assert_eq!(entries.len(), 1, "the transcript must be cached");
+        let entry = entries.pop().unwrap();
+        if check_cold_entry_provenance {
+            assert!(
+                !entry.needs_retention_provenance_migration(),
+                "the cold scan must have written provenance before it is downgraded"
+            );
+        }
+        let legacy_entry = legacy_v8_entry(entry);
+        assert_eq!(legacy_entry.messages[0].tokens.cache_write, 100000);
+
+        let key = CacheKey::new(identity, &transcript);
+        let shard_key = key.shard();
+        let shard_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(shard_path.parent().unwrap()).unwrap();
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V8,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: stored_parser_version_override.unwrap_or(identity.parser_version),
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        std::fs::write(
+            &shard_path,
+            bincode::options().serialize(&envelope).unwrap(),
+        )
+        .unwrap();
+        drop(cache);
+
+        let warm = scan();
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].tokens.cache_write_1h, 100000, "{reparse_reason}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v8_migration_rebuilds_cache_write_1h_from_an_unchanged_live_transcript() {
+        run_stale_v8_shard_is_reparsed_with_cache_write_1h(
+            ClientId::Claude,
+            "claude",
+            None,
+            true,
+            "the legacy V8 entry must be rebuilt from the unchanged live transcript",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v8_migration_rebuilds_cherrystudio_cache_write_1h_from_an_unchanged_live_transcript() {
+        run_stale_v8_shard_is_reparsed_with_cache_write_1h(
+            ClientId::CherryStudio,
+            "cherrystudio",
+            Some(1),
+            false,
+            "the stale v1 shard must be reparsed after the parser version bump",
+        );
+    }
+
+    #[test]
+    fn test_legacy_micode_v7_has_no_provenance_and_requires_one_reparse() {
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::MiMoCode);
+        let entry = test_entry(identity, source.path(), "legacy");
+        // A shard labelled 7 has to hold version-7 bytes: serializing the
+        // current layout under a 7 label would only test decoder tolerance for
+        // a state no release wrote.
+        let legacy_entry = LegacyCachedSourceEntryV7 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry
+                .messages
+                .into_iter()
+                .map(LegacyUnifiedMessageV7::from)
+                .collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        };
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V7,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.bin");
+        std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(
+            matches!(read_shard(&path,identity),ShardReadStatus::Migrated(entries)
+            if entries[0].messages.len()==1 && !entries[0].has_valid_micode_metadata())
+        );
+    }
+
     #[test]
     fn test_write_shard_round_trips_after_atomic_replace() {
         let source = write_temp_file(b"{}\n");
@@ -4804,7 +7567,7 @@ mod tests {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: to_legacy_v7_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: entry.prime_accounting,
@@ -4862,7 +7625,7 @@ mod tests {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: to_legacy_v7_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
             prime_accounting: entry.prime_accounting,
@@ -4912,6 +7675,69 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_v7_shard_migrates_messages_without_the_parent_link() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let entry = test_entry(identity, source.path(), "v7-claude");
+        let key = CacheKey::from_entry(&entry);
+        let shard_key = key.shard();
+        let legacy_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(legacy_path.parent().unwrap()).unwrap();
+        let legacy_entry = LegacyCachedSourceEntryV7 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry
+                .messages
+                .into_iter()
+                .map(LegacyUnifiedMessageV7::from)
+                .collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        };
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V7,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        let mut writer = BufWriter::new(File::create(&legacy_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // given: a shard from the release before UnifiedMessage gained the
+        // parent link, when: it is read under the current identity, then: its
+        // messages migrate with the link empty instead of being discarded.
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "v7-claude"
+                    && entries[0].messages[0].parent_session_id.is_none()
+        ));
+
+        let mut cache = SourceMessageCache::load();
+        let migrated = cache.get(identity, source.path()).unwrap();
+        assert_eq!(migrated.messages[0].session_id, "v7-claude");
+        assert!(migrated.messages[0].parent_session_id.is_none());
+        assert!(cache.has_rewrite_shard(&shard_key));
+        cache.save_if_dirty();
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Loaded(entries) if entries.len() == 1
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_v4_shard_migrates_messages_and_rewrites_once() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
@@ -4927,7 +7753,7 @@ mod tests {
             parser_version: entry.parser_version,
             path: entry.path,
             fingerprint: entry.fingerprint,
-            messages: entry.messages,
+            messages: to_legacy_v7_messages(entry.messages),
             fallback_timestamp_indices: entry.fallback_timestamp_indices,
             codex_incremental: entry.codex_incremental,
         };
@@ -4963,6 +7789,49 @@ mod tests {
             read_shard(&legacy_path, identity),
             ShardReadStatus::Loaded(entries)
                 if entries.len() == 1 && entries[0].prime_accounting.is_none()
+        ));
+    }
+
+    /// A shard whose envelope is intact but whose payload no longer decodes is
+    /// `Invalid`, not a migration that quietly produced nothing. The
+    /// released-binary gate failed the job on the decoder's stderr warning for
+    /// the same reason: a legacy branch that stops decoding has to discard
+    /// loudly rather than report an empty cache as a successful read.
+    ///
+    /// This is the branch the parser-identity check hides. `read_shard_with_limit`
+    /// compares the identity before it looks at the format, so a predecessor's
+    /// shard is already `Stale` and never reaches a decoder -- only a shard
+    /// written under the running identity with an older `CACHE_FORMAT_VERSION`
+    /// does.
+    #[test]
+    #[serial_test::serial]
+    fn a_legacy_format_shard_whose_payload_will_not_decode_is_invalid() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Dsh);
+        let key = CacheShardKey {
+            namespace: identity.namespace.to_string(),
+            index: 0,
+        };
+        let path = shard_path(&cache_shard_dir().unwrap(), &key);
+        ensure_cache_dir(path.parent().unwrap()).unwrap();
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V6,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: b"an entry layout that does not deserialize".to_vec(),
+        };
+        {
+            let mut writer = BufWriter::new(File::create(&path).unwrap());
+            bincode::options()
+                .serialize_into(&mut writer, &envelope)
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Invalid(_)
         ));
     }
 
@@ -5006,6 +7875,7 @@ mod tests {
                 output: 1,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -5023,6 +7893,7 @@ mod tests {
                 output: 8,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -5574,6 +8445,7 @@ mod tests {
                 output: 2,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,

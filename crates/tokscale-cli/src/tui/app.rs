@@ -19,13 +19,14 @@ use super::codex_login::{
     CodexLoginOutcome,
 };
 use super::data::{
-    AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelUsage, MonthlyUsage,
-    SessionUsage, TokenBreakdown, UsageData,
+    AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelDayUsage, ModelUsage,
+    MonthlyUsage, ProjectUsage, SessionUsage, TokenBreakdown, UsageData,
 };
+use super::i18n::{format_count, tr, MessageKey, TuiLanguage};
 use super::privacy::looks_like_email;
 use super::settings::Settings;
 use super::themes::{Theme, ThemeName};
-use super::ui::dialog::{ClientPickerDialog, ConfirmDialog, DialogStack};
+use super::ui::dialog::{ClientPickerDialog, ConfirmDialog, DialogStack, LanguagePickerDialog};
 use super::ui::widgets::{get_model_color, get_provider_from_model, get_provider_shade};
 
 /// Configuration for TUI initialization
@@ -66,6 +67,7 @@ pub enum Tab {
     Minutely,
     Monthly,
     Sessions,
+    Projects,
     Stats,
     Agents,
 }
@@ -81,39 +83,54 @@ impl Tab {
             Tab::Minutely,
             Tab::Monthly,
             Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
         ]
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Tab::Overview => "Overview",
-            Tab::Usage => "Usage",
-            Tab::Models => "Models",
-            Tab::Daily => "Daily",
-            Tab::Hourly => "Hourly",
-            Tab::Minutely => "Minutely",
-            Tab::Monthly => "Monthly",
-            Tab::Sessions => "Sessions",
-            Tab::Stats => "Stats",
-            Tab::Agents => "Agents",
-        }
+        self.localized_name(TuiLanguage::En)
     }
 
+    pub fn localized_name(&self, lang: TuiLanguage) -> &'static str {
+        let key = match self {
+            Tab::Overview => MessageKey::TabOverview,
+            Tab::Usage => MessageKey::TabUsage,
+            Tab::Models => MessageKey::TabModels,
+            Tab::Daily => MessageKey::TabDaily,
+            Tab::Hourly => MessageKey::TabHourly,
+            Tab::Minutely => MessageKey::TabMinutely,
+            Tab::Monthly => MessageKey::TabMonthly,
+            Tab::Sessions => MessageKey::TabSessions,
+            Tab::Projects => MessageKey::TabProjects,
+            Tab::Stats => MessageKey::TabStats,
+            Tab::Agents => MessageKey::TabAgents,
+        };
+        tr(lang, key)
+    }
+
+    #[allow(dead_code)]
     pub fn short_name(&self) -> &'static str {
-        match self {
-            Tab::Overview => "Ovw",
-            Tab::Usage => "Use",
-            Tab::Models => "Mod",
-            Tab::Daily => "Day",
-            Tab::Hourly => "Hr",
-            Tab::Minutely => "Min",
-            Tab::Monthly => "Mon",
-            Tab::Sessions => "Ses",
-            Tab::Stats => "Sta",
-            Tab::Agents => "Agt",
-        }
+        self.localized_short_name(TuiLanguage::En)
+    }
+
+    pub fn localized_short_name(&self, lang: TuiLanguage) -> &'static str {
+        let key = match self {
+            Tab::Overview => MessageKey::TabOverviewShort,
+            Tab::Usage => MessageKey::TabUsageShort,
+            Tab::Models => MessageKey::TabModelsShort,
+            Tab::Daily => MessageKey::TabDailyShort,
+            Tab::Hourly => MessageKey::TabHourlyShort,
+            Tab::Minutely => MessageKey::TabMinutelyShort,
+            Tab::Monthly => MessageKey::TabMonthlyShort,
+            Tab::Sessions => MessageKey::TabSessionsShort,
+            Tab::Projects => MessageKey::TabProjectsShort,
+            Tab::Stats => MessageKey::TabStatsShort,
+            Tab::Agents => MessageKey::TabAgentsShort,
+        };
+        tr(lang, key)
     }
 
     pub fn next(self) -> Tab {
@@ -125,7 +142,8 @@ impl Tab {
             Tab::Hourly => Tab::Minutely,
             Tab::Minutely => Tab::Monthly,
             Tab::Monthly => Tab::Sessions,
-            Tab::Sessions => Tab::Stats,
+            Tab::Sessions => Tab::Projects,
+            Tab::Projects => Tab::Stats,
             Tab::Stats => Tab::Agents,
             Tab::Agents => Tab::Overview,
         }
@@ -141,7 +159,8 @@ impl Tab {
             Tab::Minutely => Tab::Hourly,
             Tab::Monthly => Tab::Minutely,
             Tab::Sessions => Tab::Monthly,
-            Tab::Stats => Tab::Sessions,
+            Tab::Projects => Tab::Sessions,
+            Tab::Stats => Tab::Projects,
             Tab::Agents => Tab::Stats,
         }
     }
@@ -188,6 +207,7 @@ pub struct DailyDetailRow<'a> {
     pub tokens: &'a TokenBreakdown,
     pub cost: f64,
     pub messages: u64,
+    pub ms_per_1k_tokens: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +347,12 @@ pub struct App {
     monthly_list_selected_index: usize,
     monthly_list_scroll_offset: usize,
 
+    /// `ModelUsage::group_key` of the Models row whose daily trend is open.
+    pub selected_model_trend: Option<String>,
+    models_list_selected_index: usize,
+    models_list_scroll_offset: usize,
+    models_list_sort: (SortField, SortDirection),
+
     pub selected_graph_cell: Option<(usize, usize)>,
     pub stats_breakdown_total_lines: usize,
 
@@ -352,8 +378,14 @@ pub struct App {
     pub dialog_stack: DialogStack,
 
     pub dialog_needs_reload: Rc<RefCell<bool>>,
+    pub dialog_language_selected: Rc<RefCell<TuiLanguage>>,
+    pub dialog_needs_save_language: Rc<RefCell<bool>>,
 
     pub hourly_view_mode: HourlyViewMode,
+
+    /// When true, the Sessions tab shows subagent sessions rolled into their
+    /// parent session (combined tokens/cost) instead of as separate rows.
+    pub roll_up_subagents: bool,
 
     pub model_shade_map: HashMap<String, Color>,
 
@@ -448,6 +480,8 @@ impl App {
         let has_data = !data.models.is_empty();
         let dialog_stack = DialogStack::new(theme.clone());
         let dialog_needs_reload = Rc::new(RefCell::new(false));
+        let dialog_language_selected = Rc::new(RefCell::new(settings.tui_language));
+        let dialog_needs_save_language = Rc::new(RefCell::new(false));
         let confirmed_codex_use_account_id = Rc::new(RefCell::new(None));
         let confirmed_codex_remove_account_id = Rc::new(RefCell::new(None));
         let confirmed_codex_reset_account_id = Rc::new(RefCell::new(None));
@@ -482,6 +516,10 @@ impl App {
             selected_monthly_detail_month: None,
             monthly_list_selected_index: 0,
             monthly_list_scroll_offset: 0,
+            selected_model_trend: None,
+            models_list_selected_index: 0,
+            models_list_scroll_offset: 0,
+            models_list_sort: (SortField::Cost, SortDirection::Descending),
             selected_graph_cell: None,
             stats_breakdown_total_lines: 0,
             auto_refresh,
@@ -502,7 +540,10 @@ impl App {
             needs_reload: false,
             dialog_stack,
             dialog_needs_reload,
+            dialog_language_selected,
+            dialog_needs_save_language,
             hourly_view_mode: HourlyViewMode::default(),
+            roll_up_subagents: false,
             model_shade_map: HashMap::new(),
             subscription_usage: {
                 #[cfg(not(test))]
@@ -568,6 +609,17 @@ impl App {
                 self.selected_daily_detail_date = None;
                 self.selected_index = self.daily_list_selected_index;
                 self.scroll_offset = self.daily_list_scroll_offset;
+            }
+        }
+
+        // Same for the model trend: exit if its Models row disappeared, e.g.
+        // after a source or grouping change.
+        if let Some(ref key) = self.selected_model_trend {
+            if !self.data.models.iter().any(|m| &m.group_key == key) {
+                self.selected_model_trend = None;
+                (self.sort_field, self.sort_direction) = self.models_list_sort;
+                self.selected_index = self.models_list_selected_index;
+                self.scroll_offset = self.models_list_scroll_offset;
             }
         }
 
@@ -652,6 +704,8 @@ impl App {
             *self.dialog_needs_reload.borrow_mut() = false;
             self.needs_reload = true;
         }
+
+        self.apply_pending_language_change();
 
         // Poll background usage fetch
         if let Some(ref rx) = self.usage_rx {
@@ -787,6 +841,27 @@ impl App {
         }
     }
 
+    pub fn apply_pending_language_change(&mut self) {
+        if *self.dialog_needs_save_language.borrow() {
+            *self.dialog_needs_save_language.borrow_mut() = false;
+            let new_lang = *self.dialog_language_selected.borrow();
+            self.settings.tui_language = new_lang;
+            if let Err(e) = Settings::update_and_save("tuiLanguage", new_lang.code()) {
+                self.set_status(&format!(
+                    "{} {}",
+                    tr(new_lang, MessageKey::StatusLanguageSaveFailed),
+                    e
+                ));
+            } else {
+                self.set_status(&format!(
+                    "{} {}",
+                    tr(new_lang, MessageKey::StatusLanguageChanged),
+                    new_lang.native_name()
+                ));
+            }
+        }
+    }
+
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         // Remap the produced character to its US-QWERTY physical position so
         // single-letter hotkeys keep working under non-Latin layouts (Russian,
@@ -796,6 +871,7 @@ impl App {
         let code = crate::tui::keymap::normalize_hotkey(key.code);
 
         if code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.apply_pending_language_change();
             self.should_quit = true;
             return true;
         }
@@ -803,6 +879,7 @@ impl App {
         if self.dialog_stack.is_active() {
             self.dialog_stack.handle_key(key.code);
             self.consume_confirmed_codex_account_action();
+            self.apply_pending_language_change();
             return false;
         }
 
@@ -816,6 +893,7 @@ impl App {
 
         match code {
             KeyCode::Char('q') => {
+                self.apply_pending_language_change();
                 self.should_quit = true;
                 return true;
             }
@@ -921,6 +999,9 @@ impl App {
             KeyCode::Char('g') => {
                 self.open_group_by_picker();
             }
+            KeyCode::Char('k') => {
+                self.open_language_picker();
+            }
             // Only meaningful while workspace rows are on screen; leaving `w`
             // inert elsewhere keeps it free for other tabs later.
             KeyCode::Char('w')
@@ -938,6 +1019,24 @@ impl App {
                 self.needs_reload = true;
                 self.reset_selection();
             }
+            KeyCode::Char('b') if self.current_tab == Tab::Sessions => {
+                self.roll_up_subagents = !self.roll_up_subagents;
+                self.reset_selection();
+                let lang = self.settings.tui_language;
+                let count = self.active_sessions().len();
+                let state = tr(
+                    lang,
+                    if self.roll_up_subagents {
+                        MessageKey::StatusSubagentRollupOn
+                    } else {
+                        MessageKey::StatusSubagentRollupOff
+                    },
+                );
+                self.set_status(&format!(
+                    "{state}{}",
+                    format_count(lang, count, MessageKey::CountSessions)
+                ));
+            }
             KeyCode::Char('a') if self.current_tab == Tab::Usage => {
                 self.start_codex_login();
             }
@@ -953,6 +1052,9 @@ impl App {
             KeyCode::Enter if self.current_tab == Tab::Monthly => {
                 self.open_selected_monthly_detail();
             }
+            KeyCode::Enter if self.current_tab == Tab::Models => {
+                self.open_selected_model_trend();
+            }
             KeyCode::Enter if self.current_tab == Tab::Stats => {
                 self.handle_graph_selection();
             }
@@ -965,6 +1067,11 @@ impl App {
                 if self.current_tab == Tab::Monthly && self.is_monthly_detail_active() =>
             {
                 self.close_monthly_detail();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_tab == Tab::Models && self.is_model_trend_active() =>
+            {
+                self.close_model_trend();
             }
             KeyCode::Esc if self.selected_graph_cell.is_some() => {
                 self.selected_graph_cell = None;
@@ -1609,6 +1716,11 @@ impl App {
     }
 
     fn reset_selection(&mut self) {
+        // Leaving an open trend must hand the Models list back its own sort,
+        // not the trend's Date sort.
+        if self.current_tab == Tab::Models && self.is_model_trend_active() {
+            (self.sort_field, self.sort_direction) = self.models_list_sort;
+        }
         self.scroll_offset = 0;
         self.selected_index = 0;
         self.selected_daily_detail_date = None;
@@ -1617,11 +1729,21 @@ impl App {
         self.selected_monthly_detail_month = None;
         self.monthly_list_selected_index = 0;
         self.monthly_list_scroll_offset = 0;
+        self.selected_model_trend = None;
+        self.models_list_selected_index = 0;
+        self.models_list_scroll_offset = 0;
         self.selected_graph_cell = None;
         self.stats_breakdown_total_lines = 0;
     }
 
     fn switch_tab(&mut self, target: Tab) {
+        // `persist_current_sort` skips the trend's borrowed sort; save the
+        // Models list's own sort instead so returning to the tab restores it.
+        if self.current_tab == Tab::Models && self.is_model_trend_active() && target != Tab::Models
+        {
+            self.tab_sort_state
+                .insert(Tab::Models, self.models_list_sort);
+        }
         self.persist_current_sort();
 
         self.current_tab = target;
@@ -1630,6 +1752,9 @@ impl App {
         }
         if target != Tab::Monthly {
             self.selected_monthly_detail_month = None;
+        }
+        if target != Tab::Models {
+            self.selected_model_trend = None;
         }
 
         let (field, dir) = self
@@ -1682,6 +1807,11 @@ impl App {
     }
 
     fn persist_current_sort(&mut self) {
+        // The model trend borrows the Models tab's sort fields; its own sort
+        // is not the Models list's, so it is never saved as that tab's.
+        if self.current_tab == Tab::Models && self.is_model_trend_active() {
+            return;
+        }
         self.tab_sort_state
             .insert(self.current_tab, (self.sort_field, self.sort_direction));
     }
@@ -1795,6 +1925,7 @@ impl App {
 
     fn get_current_list_len(&self) -> usize {
         match self.current_tab {
+            Tab::Models if self.is_model_trend_active() => self.get_sorted_model_trend_rows().len(),
             Tab::Overview | Tab::Models => self.data.models.len(),
             Tab::Agents => self.data.agents.len(),
             Tab::Daily if self.is_daily_detail_active() => {
@@ -1807,7 +1938,8 @@ impl App {
                 self.get_sorted_monthly_detail_days().len()
             }
             Tab::Monthly => self.data.monthly.len(),
-            Tab::Sessions => self.data.sessions.len(),
+            Tab::Sessions => self.active_sessions().len(),
+            Tab::Projects => self.data.projects.len(),
             Tab::Stats => {
                 if self.selected_graph_cell.is_some() {
                     self.stats_breakdown_total_lines
@@ -1836,6 +1968,7 @@ impl App {
         self.persist_current_sort();
         if (self.current_tab == Tab::Daily && self.is_daily_detail_active())
             || (self.current_tab == Tab::Monthly && self.is_monthly_detail_active())
+            || (self.current_tab == Tab::Models && self.is_model_trend_active())
         {
             self.selected_index = 0;
             self.scroll_offset = 0;
@@ -1891,7 +2024,7 @@ impl App {
         };
         self.dialog_stack.set_theme(self.theme.clone());
         self.settings.set_theme(new_theme);
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = Settings::update_and_save("colorPalette", new_theme.as_str()) {
             self.set_status(&format!(
                 "Theme: {} (save failed: {})",
                 new_theme.as_str(),
@@ -1903,6 +2036,7 @@ impl App {
     }
     fn toggle_light_mode(&mut self) {
         self.settings.tui_light_mode = !self.settings.tui_light_mode;
+        let light_mode = self.settings.tui_light_mode;
         let name = self.theme.name;
         self.theme = if self.settings.tui_light_mode {
             Theme::from_name_for_current_terminal_light(name)
@@ -1915,7 +2049,7 @@ impl App {
         } else {
             "off"
         };
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = Settings::update_and_save("tuiLightMode", light_mode) {
             self.set_status(&format!("Light mode: {} (save failed: {})", state, e));
         } else {
             self.set_status(&format!("Light mode: {}", state));
@@ -1926,6 +2060,7 @@ impl App {
         let dialog = ClientPickerDialog::new(
             self.enabled_clients.clone(),
             self.dialog_needs_reload.clone(),
+            self.settings.tui_language,
         );
         self.dialog_stack.show(Box::new(dialog));
     }
@@ -1959,8 +2094,20 @@ impl App {
 
     fn open_group_by_picker(&mut self) {
         use super::ui::dialog::GroupByPickerDialog;
-        let dialog =
-            GroupByPickerDialog::new(self.group_by.clone(), self.dialog_needs_reload.clone());
+        let dialog = GroupByPickerDialog::new(
+            self.group_by.clone(),
+            self.dialog_needs_reload.clone(),
+            self.settings.tui_language,
+        );
+        self.dialog_stack.show(Box::new(dialog));
+    }
+
+    pub fn open_language_picker(&mut self) {
+        *self.dialog_language_selected.borrow_mut() = self.settings.tui_language;
+        let dialog = LanguagePickerDialog::new(
+            self.dialog_language_selected.clone(),
+            self.dialog_needs_save_language.clone(),
+        );
         self.dialog_stack.show(Box::new(dialog));
     }
 
@@ -2065,13 +2212,76 @@ impl App {
         self.clamp_selection();
     }
 
+    fn open_selected_model_trend(&mut self) {
+        if self.is_model_trend_active() {
+            return;
+        }
+
+        let selected = self
+            .get_sorted_models()
+            .get(self.selected_index)
+            .map(|m| (m.group_key.clone(), m.model.clone(), m.daily.is_empty()));
+
+        // Rows painted from the TUI cache carry no daily series, and a cache
+        // written before `groupKey` existed gives every row the same empty
+        // key. Opening a trend from either would show a blank or a wrong
+        // model, so wait for the background refresh to deliver real rows.
+        if matches!(&selected, Some((key, _, no_daily)) if key.is_empty() || *no_daily) {
+            self.set_status("Daily trend is still loading; try again after the refresh");
+            return;
+        }
+
+        if let Some((key, model, _)) = selected {
+            self.models_list_selected_index = self.selected_index;
+            self.models_list_scroll_offset = self.scroll_offset;
+            self.models_list_sort = (self.sort_field, self.sort_direction);
+            self.selected_model_trend = Some(key);
+            // A trend reads oldest-to-newest top-down as newest first, like the
+            // Daily tab; the Models sort is restored on the way out.
+            self.sort_field = SortField::Date;
+            self.sort_direction = SortDirection::Descending;
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing daily trend for {}", model));
+            self.clamp_selection();
+        }
+    }
+
+    fn close_model_trend(&mut self) {
+        let Some(key) = self.selected_model_trend.take() else {
+            return;
+        };
+
+        (self.sort_field, self.sort_direction) = self.models_list_sort;
+
+        let restored_index = self
+            .get_sorted_models()
+            .iter()
+            .position(|m| m.group_key == key)
+            .unwrap_or(self.models_list_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.models_list_scroll_offset
+            && restored_index < self.models_list_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.models_list_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to models");
+        self.clamp_selection();
+    }
+
     fn toggle_auto_refresh(&mut self) {
         self.auto_refresh = !self.auto_refresh;
         if self.auto_refresh {
             self.last_auto_refresh = Instant::now();
         }
         self.settings.auto_refresh_enabled = self.auto_refresh;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshEnabled", self.auto_refresh);
         let msg = if self.auto_refresh {
             format!(
                 "Auto-refresh ON ({}s)",
@@ -2092,7 +2302,7 @@ impl App {
         let new_ms = ms.saturating_add(10_000).min(300_000);
         self.auto_refresh_interval = Duration::from_millis(new_ms);
         self.settings.auto_refresh_ms = new_ms;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshMs", new_ms);
         let msg = format!("Refresh interval: {}s", new_ms / 1000);
         if let Err(e) = save_result {
             self.set_status(&format!("{} (save failed: {})", msg, e));
@@ -2106,7 +2316,7 @@ impl App {
         let new_ms = ms.saturating_sub(10_000).max(30_000);
         self.auto_refresh_interval = Duration::from_millis(new_ms);
         self.settings.auto_refresh_ms = new_ms;
-        let save_result = self.settings.save();
+        let save_result = Settings::update_and_save("autoRefreshMs", new_ms);
         let msg = format!("Refresh interval: {}s", new_ms / 1000);
         if let Err(e) = save_result {
             self.set_status(&format!("{} (save failed: {})", msg, e));
@@ -2117,6 +2327,10 @@ impl App {
 
     fn copy_selected_to_clipboard(&mut self) {
         let text = match self.current_tab {
+            Tab::Models if self.is_model_trend_active() => self
+                .get_sorted_model_trend_rows()
+                .get(self.selected_index)
+                .map(|d| format!("{}: {} tokens, ${:.4}", d.date, d.tokens.total(), d.cost)),
             Tab::Overview | Tab::Models => self
                 .get_sorted_models()
                 .get(self.selected_index)
@@ -2186,6 +2400,10 @@ impl App {
                     )
                 }),
             Tab::Stats | Tab::Usage => None,
+            Tab::Projects => self
+                .get_sorted_projects()
+                .get(self.selected_index)
+                .map(|p| format!("{}: {} tokens, ${:.4}", p.label, p.tokens.total(), p.cost)),
         };
 
         if let Some(text) = text {
@@ -2341,6 +2559,51 @@ impl App {
         self.selected_daily_detail_date
     }
 
+    pub fn is_model_trend_active(&self) -> bool {
+        self.selected_model_trend.is_some()
+    }
+
+    /// The Models row whose daily trend is open, if it is still loaded.
+    pub fn model_trend_model(&self) -> Option<&ModelUsage> {
+        let key = self.selected_model_trend.as_ref()?;
+        self.data.models.iter().find(|m| &m.group_key == key)
+    }
+
+    /// The open trend's days, ordered by the current sort. Date sorts are
+    /// chronological; cost and token sorts fall back to newest first.
+    pub fn get_sorted_model_trend_rows(&self) -> Vec<&ModelDayUsage> {
+        let Some(model) = self.model_trend_model() else {
+            return Vec::new();
+        };
+        let mut days: Vec<&ModelDayUsage> = model.daily.iter().collect();
+        let newest_first = |a: &&ModelDayUsage, b: &&ModelDayUsage| b.date.cmp(&a.date);
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                days.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| newest_first(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                days.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| newest_first(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => days.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| newest_first(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => days.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| newest_first(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => days.sort_by(newest_first),
+            (SortField::Date, SortDirection::Ascending) => days.sort_by_key(|d| d.date),
+        }
+
+        days
+    }
+
     pub fn is_monthly_detail_active(&self) -> bool {
         self.selected_monthly_detail_month.is_some()
     }
@@ -2388,6 +2651,7 @@ impl App {
                         tokens: &model_info.tokens,
                         cost: model_info.cost,
                         messages: model_info.messages,
+                        ms_per_1k_tokens: model_info.performance.ms_per_1k_tokens,
                     })
             })
             .collect();
@@ -2583,58 +2847,106 @@ impl App {
         self.terminal_width < 60
     }
 
-    pub fn get_sorted_sessions(&self) -> Vec<&SessionUsage> {
-        let mut sessions: Vec<&SessionUsage> = self.data.sessions.iter().collect();
-
-        let tie_breaker = |a: &&SessionUsage, b: &&SessionUsage| {
-            a.client
-                .cmp(&b.client)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        };
-
-        match (self.sort_field, self.sort_direction) {
-            (SortField::Cost, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.cost
-                    .total_cmp(&a.cost)
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Cost, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.cost
-                    .total_cmp(&b.cost)
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Tokens, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.tokens
-                    .total()
-                    .cmp(&a.tokens.total())
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Tokens, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.tokens
-                    .total()
-                    .cmp(&b.tokens.total())
-                    .then_with(|| b.last_active_ms.cmp(&a.last_active_ms))
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            // "Date" maps to last_active for sessions: most recently active
-            // session first when descending, oldest active first when ascending.
-            (SortField::Date, SortDirection::Descending) => sessions.sort_by(|a, b| {
-                b.last_active_ms
-                    .cmp(&a.last_active_ms)
-                    .then_with(|| tie_breaker(a, b))
-            }),
-            (SortField::Date, SortDirection::Ascending) => sessions.sort_by(|a, b| {
-                a.last_active_ms
-                    .cmp(&b.last_active_ms)
-                    .then_with(|| tie_breaker(a, b))
-            }),
+    /// The session list backing the Sessions tab: the flat per-session view,
+    /// or the view with subagent sessions rolled into their parents when the
+    /// user toggled roll-up on.
+    pub fn active_sessions(&self) -> &[SessionUsage] {
+        if self.roll_up_subagents {
+            &self.data.sessions_rolled
+        } else {
+            &self.data.sessions
         }
+    }
 
+    pub fn get_sorted_sessions(&self) -> Vec<&SessionUsage> {
+        let mut sessions: Vec<&SessionUsage> = self.active_sessions().iter().collect();
+        sort_usage_rows(
+            &mut sessions,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.client
+                    .cmp(&b.client)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            },
+        );
         sessions
     }
+
+    pub fn get_sorted_projects(&self) -> Vec<&ProjectUsage> {
+        let mut projects: Vec<&ProjectUsage> = self.data.projects.iter().collect();
+        sort_usage_rows(
+            &mut projects,
+            self.sort_field,
+            self.sort_direction,
+            |a, b| {
+                a.label
+                    .cmp(&b.label)
+                    .then_with(|| a.workspace_key.cmp(&b.workspace_key))
+                    .then_with(|| a.group_key.cmp(&b.group_key))
+            },
+        );
+        projects
+    }
+}
+
+/// The columns the Sessions and Projects tabs sort on. Both tabs order rows
+/// the same way -- the chosen metric, then most recent activity, then a
+/// tab-specific tie-breaker that names the row -- so the ordering lives in
+/// [`sort_usage_rows`] and each tab supplies only its tie-breaker.
+trait SortableUsage {
+    fn cost(&self) -> f64;
+    fn token_total(&self) -> u64;
+    fn last_active_ms(&self) -> i64;
+}
+
+impl SortableUsage for SessionUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+impl SortableUsage for ProjectUsage {
+    fn cost(&self) -> f64 {
+        self.cost
+    }
+    fn token_total(&self) -> u64 {
+        self.tokens.total()
+    }
+    fn last_active_ms(&self) -> i64 {
+        self.last_active_ms
+    }
+}
+
+/// Sort `rows` by `field` in `direction`, then by most recent activity, then
+/// by `tie_breaker`. "Date" is last activity itself: most recently active
+/// first when descending, oldest first when ascending.
+fn sort_usage_rows<T: SortableUsage>(
+    rows: &mut [&T],
+    field: SortField,
+    direction: SortDirection,
+    tie_breaker: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    let metric = |a: &T, b: &T| match field {
+        SortField::Cost => a.cost().total_cmp(&b.cost()),
+        SortField::Tokens => a.token_total().cmp(&b.token_total()),
+        SortField::Date => a.last_active_ms().cmp(&b.last_active_ms()),
+    };
+    rows.sort_by(|a, b| {
+        let primary = match direction {
+            SortDirection::Descending => metric(b, a),
+            SortDirection::Ascending => metric(a, b),
+        };
+        primary
+            .then_with(|| b.last_active_ms().cmp(&a.last_active_ms()))
+            .then_with(|| tie_breaker(a, b))
+    })
 }
 
 #[cfg(test)]
@@ -2652,7 +2964,7 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 10);
+        assert_eq!(tabs.len(), 11);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Usage);
         assert_eq!(tabs[2], Tab::Models);
@@ -2661,8 +2973,9 @@ mod tests {
         assert_eq!(tabs[5], Tab::Minutely);
         assert_eq!(tabs[6], Tab::Monthly);
         assert_eq!(tabs[7], Tab::Sessions);
-        assert_eq!(tabs[8], Tab::Stats);
-        assert_eq!(tabs[9], Tab::Agents);
+        assert_eq!(tabs[8], Tab::Projects);
+        assert_eq!(tabs[9], Tab::Stats);
+        assert_eq!(tabs[10], Tab::Agents);
     }
 
     #[test]
@@ -2674,7 +2987,8 @@ mod tests {
         assert_eq!(Tab::Hourly.next(), Tab::Minutely);
         assert_eq!(Tab::Minutely.next(), Tab::Monthly);
         assert_eq!(Tab::Monthly.next(), Tab::Sessions);
-        assert_eq!(Tab::Sessions.next(), Tab::Stats);
+        assert_eq!(Tab::Sessions.next(), Tab::Projects);
+        assert_eq!(Tab::Projects.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::Overview);
     }
@@ -2689,7 +3003,8 @@ mod tests {
         assert_eq!(Tab::Minutely.prev(), Tab::Hourly);
         assert_eq!(Tab::Monthly.prev(), Tab::Minutely);
         assert_eq!(Tab::Sessions.prev(), Tab::Monthly);
-        assert_eq!(Tab::Stats.prev(), Tab::Sessions);
+        assert_eq!(Tab::Projects.prev(), Tab::Sessions);
+        assert_eq!(Tab::Stats.prev(), Tab::Projects);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
     }
 
@@ -2703,6 +3018,7 @@ mod tests {
         assert_eq!(Tab::Minutely.as_str(), "Minutely");
         assert_eq!(Tab::Monthly.as_str(), "Monthly");
         assert_eq!(Tab::Sessions.as_str(), "Sessions");
+        assert_eq!(Tab::Projects.as_str(), "Projects");
         assert_eq!(Tab::Stats.as_str(), "Stats");
     }
 
@@ -2716,6 +3032,7 @@ mod tests {
         assert_eq!(Tab::Minutely.short_name(), "Min");
         assert_eq!(Tab::Monthly.short_name(), "Mon");
         assert_eq!(Tab::Sessions.short_name(), "Ses");
+        assert_eq!(Tab::Projects.short_name(), "Prj");
         assert_eq!(Tab::Stats.short_name(), "Sta");
     }
 
@@ -2802,6 +3119,8 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
             ModelUsage {
                 model: "model2".to_string(),
@@ -2814,6 +3133,8 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
         ];
 
@@ -2854,6 +3175,8 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
             ModelUsage {
                 model: "model2".to_string(),
@@ -2866,6 +3189,8 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
         ];
 
@@ -2905,6 +3230,8 @@ mod tests {
             session_count: 1,
             workspace_key: None,
             workspace_label: None,
+            group_key: String::new(),
+            daily: Vec::new(),
         }];
 
         // Set selection beyond bounds
@@ -3059,7 +3386,9 @@ mod tests {
             initial_tab: None,
             ..Default::default()
         };
-        App::new_with_cached_data(config, None).unwrap()
+        let mut app = App::new_with_cached_data(config, None).unwrap();
+        app.settings.tui_language = TuiLanguage::En;
+        app
     }
 
     fn usage_output(provider: &str, account: Option<UsageAccount>) -> UsageOutput {
@@ -3213,6 +3542,8 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                group_key: String::new(),
+                daily: Vec::new(),
             })
             .collect();
         app
@@ -3245,6 +3576,7 @@ mod tests {
                     tokens,
                     cost: model_cost,
                     messages: 1,
+                    performance: Default::default(),
                 },
             );
         }
@@ -3642,6 +3974,9 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Sessions);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Projects);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Stats);
 
         app.handle_key_event(key(KeyCode::Tab));
@@ -3661,6 +3996,9 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Stats);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Projects);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Sessions);
@@ -3698,6 +4036,7 @@ mod tests {
             Tab::Minutely,
             Tab::Monthly,
             Tab::Sessions,
+            Tab::Projects,
             Tab::Stats,
             Tab::Agents,
             Tab::Overview,
@@ -3878,6 +4217,156 @@ mod tests {
         assert_eq!(app.selected_index, 1);
         assert_eq!(app.scroll_offset, 1);
         assert_eq!(app.get_current_list_len(), 3);
+    }
+
+    fn trend_model(name: &str, cost: f64, days: &[&str]) -> ModelUsage {
+        ModelUsage {
+            model: name.to_string(),
+            color_key: name.to_string(),
+            provider: "anthropic".to_string(),
+            client: "claude".to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            tokens: TokenBreakdown::default(),
+            cost,
+            performance: Default::default(),
+            session_count: 1,
+            group_key: format!("key:{name}"),
+            daily: days
+                .iter()
+                .map(|date| ModelDayUsage {
+                    date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+                    tokens: TokenBreakdown::default(),
+                    cost: 1.0,
+                    messages: 1,
+                    performance: Default::default(),
+                })
+                .collect(),
+        }
+    }
+
+    fn models_app() -> App {
+        let mut app = make_app();
+        app.current_tab = Tab::Models;
+        app.sort_field = SortField::Cost;
+        app.sort_direction = SortDirection::Descending;
+        app.data.models = vec![
+            trend_model("cheap", 1.0, &["2026-05-01"]),
+            trend_model("target", 5.0, &["2026-05-01", "2026-05-03", "2026-05-02"]),
+            trend_model("pricey", 9.0, &["2026-05-02"]),
+        ];
+        app
+    }
+
+    #[test]
+    fn test_enter_on_models_opens_trend_newest_first_and_esc_restores_list() {
+        let mut app = models_app();
+        app.selected_index = 1; // "target" under cost-descending
+
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert!(app.is_model_trend_active());
+        assert_eq!(app.model_trend_model().unwrap().model, "target");
+        let dates: Vec<String> = app
+            .get_sorted_model_trend_rows()
+            .iter()
+            .map(|day| day.date.to_string())
+            .collect();
+        assert_eq!(dates, ["2026-05-03", "2026-05-02", "2026-05-01"]);
+        assert_eq!(app.get_current_list_len(), 3);
+
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(!app.is_model_trend_active());
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.get_current_list_len(), 3);
+    }
+
+    #[test]
+    fn test_sorting_inside_trend_does_not_change_models_sort() {
+        let mut app = models_app();
+        app.selected_index = 1;
+        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Char('t')));
+        assert_eq!(app.sort_field, SortField::Tokens);
+
+        app.switch_tab(Tab::Daily);
+        app.switch_tab(Tab::Models);
+
+        assert!(!app.is_model_trend_active());
+        assert_eq!(app.sort_field, SortField::Cost);
+    }
+
+    #[test]
+    fn test_update_data_exits_trend_when_its_model_disappears() {
+        let mut app = models_app();
+        app.selected_index = 1;
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_trend_active());
+
+        app.update_data(UsageData {
+            models: vec![trend_model("cheap", 1.0, &["2026-05-01"])],
+            ..Default::default()
+        });
+
+        assert!(!app.is_model_trend_active());
+        assert_eq!(app.sort_field, SortField::Cost);
+    }
+
+    #[test]
+    fn test_enter_does_not_open_a_trend_for_rows_painted_from_cache() {
+        // Cache hits rebuild rows without a daily series; a cache from before
+        // `groupKey` also gives every row the same empty key. Neither may open
+        // a trend until the background refresh delivers real rows.
+        let mut cached = models_app();
+        for model in &mut cached.data.models {
+            model.daily.clear();
+        }
+        cached.selected_index = 1;
+        cached.handle_key_event(key(KeyCode::Enter));
+        assert!(!cached.is_model_trend_active());
+        assert_eq!(cached.sort_field, SortField::Cost);
+
+        let mut legacy = models_app();
+        for model in &mut legacy.data.models {
+            model.group_key.clear();
+        }
+        legacy.selected_index = 1;
+        legacy.handle_key_event(key(KeyCode::Enter));
+        assert!(!legacy.is_model_trend_active());
+    }
+
+    #[test]
+    fn test_reset_selection_inside_a_trend_restores_the_models_list_sort() {
+        let mut app = models_app();
+        app.selected_index = 1;
+        app.handle_key_event(key(KeyCode::Enter));
+        assert_eq!(app.sort_field, SortField::Date);
+
+        app.reset_selection();
+
+        assert!(!app.is_model_trend_active());
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
+
+    #[test]
+    fn test_switching_tabs_from_a_trend_keeps_a_custom_models_list_sort() {
+        let mut app = models_app();
+        app.handle_key_event(key(KeyCode::Char('t')));
+        let list_sort = (app.sort_field, app.sort_direction);
+        assert_eq!(list_sort.0, SortField::Tokens);
+        app.selected_index = 1;
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_trend_active());
+
+        app.switch_tab(Tab::Daily);
+        app.switch_tab(Tab::Models);
+
+        assert!(!app.is_model_trend_active());
+        assert_eq!((app.sort_field, app.sort_direction), list_sort);
     }
 
     #[test]
@@ -4227,6 +4716,257 @@ mod tests {
             app.handle_key_event(key(KeyCode::Char('p')));
         }
         assert_eq!(app.theme.name, initial_theme);
+    }
+
+    // Other app tests also save settings without taking the serial-test lock.
+    // Give these disk-backed tests their own process instead of changing the
+    // config directory underneath those tests.
+    fn settings_test_runs_in_child(test_name: &str) -> bool {
+        const MARKER: &str = "TOKSCALE_TUI_SETTINGS_TEST";
+        if env::var(MARKER).as_deref() == Ok(test_name) {
+            return true;
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("tui::app::tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env(MARKER, test_name)
+            .env("TOKSCALE_CONFIG_DIR", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        false
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let initial = Settings {
+            auto_refresh_enabled: true,
+            ..Settings::default()
+        };
+        let cases = [
+            (
+                key(KeyCode::Char('p')),
+                "colorPalette",
+                serde_json::json!(initial.theme_name().next().as_str()),
+            ),
+            (
+                key(KeyCode::Char('L')),
+                "tuiLightMode",
+                serde_json::json!(true),
+            ),
+            (
+                key_with_mod(KeyCode::Char('R'), KeyModifiers::SHIFT),
+                "autoRefreshEnabled",
+                serde_json::json!(false),
+            ),
+            (
+                key(KeyCode::Char('+')),
+                "autoRefreshMs",
+                serde_json::json!(70_000),
+            ),
+            (
+                key(KeyCode::Char('-')),
+                "autoRefreshMs",
+                serde_json::json!(50_000),
+            ),
+        ];
+
+        for (event, field, value) in cases {
+            fs::write(&path, serde_json::to_vec(&initial).unwrap()).unwrap();
+            let mut app = make_app();
+            assert!(app.settings.usage.disabled_providers.is_empty());
+
+            let mut expected = serde_json::to_value(&initial).unwrap();
+            expected["usage"]["disabledProviders"] = serde_json::json!(["copilot"]);
+            expected["colorPalette"] = serde_json::json!("halloween");
+            expected["tuiLightMode"] = serde_json::json!(true);
+            expected["autoRefreshEnabled"] = serde_json::json!(false);
+            expected["autoRefreshMs"] = serde_json::json!(120_000);
+            expected["defaultClients"] = serde_json::json!(["claude"]);
+            expected["autosubmit"]["enabled"] = serde_json::json!(true);
+            expected["futurePreference"] = serde_json::json!({"enabled": true});
+            expected["usage"]["futureProviderOption"] = serde_json::json!(["keep", 7]);
+            expected["scanner"]["futureScanOption"] = serde_json::json!("keep");
+            expected["nativeTimeoutMs"] = serde_json::json!(1);
+            expected[field] = serde_json::to_value(&initial).unwrap()[field].clone();
+            fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+
+            app.handle_key_event(event);
+
+            expected[field] = value.clone();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved, expected, "unexpected settings after {event:?}");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap()[field], value);
+            assert!(!app
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("save failed"));
+        }
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_unknown_number_precision() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_unknown_number_precision") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let mut app = make_app();
+        for number in [
+            "18446744073709551617",
+            "0.12345678901234567890123456789",
+            "1e400",
+        ] {
+            let nested = format!(r#"{{ "values" : [ {number} ] }}"#);
+            fs::write(
+                &path,
+                format!(r#"{{"futureNumber":{number},"futureObject":{nested}}}"#),
+            )
+            .unwrap();
+            app.handle_key_event(key(KeyCode::Char('p')));
+            let saved = fs::read_to_string(&path).unwrap();
+            assert!(saved.contains(number), "number changed in {saved}");
+            assert!(saved.contains(&nested), "nested JSON changed in {saved}");
+            assert!(saved.contains(app.theme.name.as_str()));
+            assert!(!app
+                .status_message
+                .as_deref()
+                .unwrap()
+                .contains("save failed"));
+        }
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_sparse_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_sparse_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        let mut app = make_app();
+        app.handle_key_event(key(KeyCode::Char('L')));
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({"tuiLightMode": true}));
+
+        let mut external = serde_json::json!({
+            "futurePreference": {"enabled": true},
+            "usage": {"disabledProviders": ["copilot"], "futureProviderOption": "keep"}
+        });
+        fs::write(&path, serde_json::to_vec(&external).unwrap()).unwrap();
+        app.handle_key_event(key(KeyCode::Char('p')));
+        external["colorPalette"] = app.theme.name.as_str().into();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, external);
+    }
+
+    #[test]
+    fn tui_settings_changes_preserve_malformed_external_edits() {
+        if !settings_test_runs_in_child("tui_settings_changes_preserve_malformed_external_edits") {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        for malformed in [r#"{"usage":{"disabledProviders":{"copilot":true}}}"#, "[]"] {
+            for event in [key(KeyCode::Char('p')), key(KeyCode::Char('L'))] {
+                fs::write(&path, b"{}").unwrap();
+                let mut app = make_app();
+                fs::write(&path, malformed).unwrap();
+
+                app.handle_key_event(event);
+
+                assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+                assert!(app
+                    .status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("save failed"));
+                if event.code == KeyCode::Char('p') {
+                    assert_eq!(app.theme.name, ThemeName::Blue.next());
+                } else {
+                    assert!(app.settings.tui_light_mode);
+                }
+            }
+        }
+    }
+
+    // ── handle_key_event: subagent roll-up ─────────────────────────
+
+    #[test]
+    fn test_sessions_tab_b_toggles_subagent_rollup() {
+        let mut app = make_app();
+        app.current_tab = Tab::Sessions;
+        assert!(!app.roll_up_subagents);
+
+        app.handle_key_event(key(KeyCode::Char('b')));
+        assert!(app.roll_up_subagents);
+
+        app.handle_key_event(key(KeyCode::Char('b')));
+        assert!(!app.roll_up_subagents);
+    }
+
+    #[test]
+    fn test_rollup_toggle_updates_list_length() {
+        // given: three flat sessions; the rolled view collapses two
+        // subagents into the parent row
+        let mut app = make_app();
+        app.current_tab = Tab::Sessions;
+        let mk = |session_id: &str| {
+            let mut s = SessionUsage::new("pi", session_id);
+            s.cost = 1.0;
+            s.message_count = 1;
+            s
+        };
+        app.data.sessions = vec![mk("parent"), mk("child-1"), mk("child-2")];
+        app.data.sessions_rolled = vec![mk("parent")];
+
+        // when: toggled, selection/paging bounds must follow the rendered list
+        assert_eq!(app.get_current_list_len(), 3);
+        app.handle_key_event(key(KeyCode::Char('b')));
+        assert_eq!(app.get_current_list_len(), 1);
+    }
+
+    #[test]
+    fn test_b_ignored_outside_sessions_tab() {
+        let mut app = make_app();
+        app.current_tab = Tab::Overview;
+        app.handle_key_event(key(KeyCode::Char('b')));
+        assert!(!app.roll_up_subagents);
+    }
+
+    #[test]
+    fn test_active_sessions_follows_rollup_toggle() {
+        let mut app = make_app();
+        let mut child = SessionUsage::new("pi", "child");
+        child.cost = 0.5;
+        child.message_count = 1;
+        let mut parent = SessionUsage::new("pi", "parent");
+        parent.cost = 1.5;
+        parent.message_count = 3;
+        parent.subagent_count = 1;
+        app.data.sessions = vec![child];
+        app.data.sessions_rolled = vec![parent];
+
+        assert_eq!(app.active_sessions()[0].session_id, "child");
+        app.roll_up_subagents = true;
+        assert_eq!(app.active_sessions()[0].session_id, "parent");
     }
 
     // ── handle_key_event: export ────────────────────────────────────
@@ -4975,6 +5715,8 @@ mod tests {
             cost,
             performance: Default::default(),
             session_count: 1,
+            group_key: String::new(),
+            daily: Vec::new(),
         }
     }
 
@@ -5126,6 +5868,8 @@ mod tests {
                 cost: 10.0,
                 performance: Default::default(),
                 session_count: 1,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
             ModelUsage {
                 model: "gpt-5".to_string(),
@@ -5138,6 +5882,8 @@ mod tests {
                 cost: 1.0,
                 performance: Default::default(),
                 session_count: 1,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
         ];
         app.build_model_shade_map();
@@ -5195,6 +5941,8 @@ mod tests {
                 cost: 10.0,
                 performance: Default::default(),
                 session_count: 1,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
             ModelUsage {
                 model: "sonnet-shared".to_string(),
@@ -5207,6 +5955,8 @@ mod tests {
                 cost: 5.0,
                 performance: Default::default(),
                 session_count: 1,
+                group_key: String::new(),
+                daily: Vec::new(),
             },
         ];
         app.build_model_shade_map();
@@ -5243,6 +5993,8 @@ mod tests {
             cost: 3.0,
             performance: Default::default(),
             session_count: 1,
+            group_key: String::new(),
+            daily: Vec::new(),
         };
         app.data.models = vec![
             ModelUsage {
@@ -5273,5 +6025,36 @@ mod tests {
             app.model_color_for("github-copilot", "claude-fable-5"),
             app.theme.color(get_provider_shade("github-copilot", 0))
         );
+    }
+
+    #[test]
+    fn test_language_picker_hotkey_and_change() {
+        if !settings_test_runs_in_child("test_language_picker_hotkey_and_change") {
+            return;
+        }
+
+        let mut app = make_app();
+        assert_eq!(app.settings.tui_language, TuiLanguage::En);
+        assert!(!app.dialog_stack.is_active());
+
+        // Press 'k' to open language picker
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert!(app.dialog_stack.is_active());
+
+        // Down arrow to Korean (2nd option), Enter to select
+        app.handle_key_event(key(KeyCode::Down));
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(!app.dialog_stack.is_active());
+
+        // Process tick to apply language change
+        app.on_tick();
+        assert_eq!(app.settings.tui_language, TuiLanguage::Ko);
+
+        // Header tab names should reflect Korean
+        assert_eq!(
+            Tab::Overview.localized_name(app.settings.tui_language),
+            "개요"
+        );
+        assert_eq!(Tab::Daily.localized_name(app.settings.tui_language), "일별");
     }
 }

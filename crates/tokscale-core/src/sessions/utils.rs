@@ -196,6 +196,20 @@ pub(crate) fn extract_i64(value: Option<&Value>) -> Option<i64> {
     })
 }
 
+/// Read `usage.cache_creation.ephemeral_1h_input_tokens` from a raw JSON
+/// `usage` block, for the `serde_json::Value` parsing path that never
+/// deserializes into [`AnthropicUsage`]. Clamped at zero, not yet against
+/// the usage block's `cache_creation_input_tokens` total.
+pub(crate) fn extract_cache_write_1h(usage: &Value) -> i64 {
+    extract_i64(
+        usage
+            .get("cache_creation")
+            .and_then(|creation| creation.get("ephemeral_1h_input_tokens")),
+    )
+    .unwrap_or(0)
+    .max(0)
+}
+
 pub(crate) fn extract_string(value: Option<&Value>) -> Option<String> {
     value.and_then(|val| val.as_str().map(|s| s.to_string()))
 }
@@ -584,6 +598,14 @@ pub(crate) fn resolved_provider(
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// The nested `cache_creation` split Anthropic reports beside the summed
+/// `cache_creation_input_tokens`. Absent on transcripts recorded before the
+/// 1-hour TTL cache existed, and on any client that never asked for it.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicCacheCreation {
+    pub ephemeral_1h_input_tokens: Option<i64>,
+}
+
 /// The Anthropic Messages API `usage` block in its snake_case wire spelling.
 ///
 /// Shared by the clients that persist Anthropic responses verbatim
@@ -602,19 +624,49 @@ pub struct AnthropicUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
+    pub cache_creation: Option<AnthropicCacheCreation>,
 }
 
 impl AnthropicUsage {
+    /// Whether this usage object describes the prompt/caching split, rather than
+    /// being a bare snapshot of the whole prompt.
+    ///
+    /// Anthropic's own responses always carry both cache keys, so their
+    /// `input_tokens` is the uncached remainder and can be compared with another
+    /// entry's. Some third-party models behind Claude Code instead emit one
+    /// content block per response and omit the cache keys entirely; there
+    /// `input_tokens` is the whole prompt, so it is not comparable.
+    ///
+    /// Key presence is the signal, not the value: a short prompt that never
+    /// reached the cache minimum is reported as an explicit `0`, and that is
+    /// still a genuine split.
+    pub fn reports_cache_split(&self) -> bool {
+        self.cache_read_input_tokens.is_some() || self.cache_creation_input_tokens.is_some()
+    }
+
     /// Token breakdown with every field clamped at zero. This block carries no
     /// reasoning bucket, so `reasoning` is always 0.
     pub fn to_breakdown(&self) -> TokenBreakdown {
+        let cache_write = self.cache_creation_input_tokens.unwrap_or(0).max(0);
         TokenBreakdown {
             input: self.input_tokens.unwrap_or(0).max(0),
             output: self.output_tokens.unwrap_or(0).max(0),
             cache_read: self.cache_read_input_tokens.unwrap_or(0).max(0),
-            cache_write: self.cache_creation_input_tokens.unwrap_or(0).max(0),
+            cache_write,
+            cache_write_1h: self.cache_write_1h_raw().min(cache_write),
             reasoning: 0,
         }
+    }
+
+    /// The `ephemeral_1h_input_tokens` bucket, clamped at zero but not yet
+    /// against `cache_write`. Transcripts without the nested `cache_creation`
+    /// object report 0, matching today's behaviour.
+    pub fn cache_write_1h_raw(&self) -> i64 {
+        self.cache_creation
+            .as_ref()
+            .and_then(|creation| creation.ephemeral_1h_input_tokens)
+            .unwrap_or(0)
+            .max(0)
     }
 }
 
@@ -644,6 +696,12 @@ pub(crate) struct CamelUsage {
     /// a disagreeing total must not silently override them.
     #[allow(dead_code)]
     pub(crate) total_tokens: Option<i64>,
+    /// Reasoning tokens, when the writer records them. OpenClaw adds this to
+    /// the block for turns it ran through Codex app-server, where it is the
+    /// Codex `reasoning_output_tokens` figure — a subset of `output`, never
+    /// added on top of it. Only [`CamelUsage::to_breakdown_with_reasoning`]
+    /// reads it; `gjc` keeps ignoring it through [`CamelUsage::to_breakdown`].
+    pub(crate) reasoning_tokens: Option<i64>,
     pub(crate) cost: Option<CamelCost>,
 }
 
@@ -656,8 +714,30 @@ impl CamelUsage {
             output: self.output.unwrap_or(0).max(0),
             cache_read: self.cache_read.unwrap_or(0).max(0),
             cache_write: self.cache_write.unwrap_or(0).max(0),
+            cache_write_1h: 0,
             reasoning: 0,
         }
+    }
+
+    /// [`CamelUsage::to_breakdown`] plus the `reasoningTokens` split.
+    ///
+    /// `reasoningTokens` is a subset of `output` (it is what OpenClaw copies
+    /// from Codex's `reasoning_output_tokens`, and OpenClaw's own `totalTokens`
+    /// never adds it on top), while `TokenBreakdown` buckets are additive. So
+    /// it is moved out of `output` into `reasoning` rather than carried in
+    /// both, clamped so a row claiming more reasoning than output cannot
+    /// drive the output bucket negative — the same correction the Codex
+    /// parser applies to the same figure.
+    pub(crate) fn to_breakdown_with_reasoning(&self) -> TokenBreakdown {
+        let mut breakdown = self.to_breakdown();
+        let reasoning = self
+            .reasoning_tokens
+            .unwrap_or(0)
+            .max(0)
+            .min(breakdown.output);
+        breakdown.output -= reasoning;
+        breakdown.reasoning = reasoning;
+        breakdown
     }
 }
 

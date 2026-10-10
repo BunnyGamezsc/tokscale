@@ -870,7 +870,7 @@ impl PricingLookup {
             } else {
                 if let Some(result) = choose_best_source_result_with_models_dev(
                     self.exact_match_litellm_for_provider(stripped, provider_id),
-                    self.exact_match_openrouter_for_provider(stripped, provider_id),
+                    self.exact_or_normalized_openrouter_for_provider(stripped, provider_id),
                     self.exact_match_models_dev_for_provider(stripped, provider_id),
                     provider_id,
                 ) {
@@ -909,7 +909,7 @@ impl PricingLookup {
 
         if let Some(result) = choose_best_source_result_with_models_dev(
             self.exact_match_litellm_for_provider(model_id, provider_id),
-            self.exact_match_openrouter_for_provider(model_id, provider_id),
+            self.exact_or_normalized_openrouter_for_provider(model_id, provider_id),
             self.exact_match_models_dev_for_provider(model_id, provider_id),
             provider_id,
         ) {
@@ -1185,6 +1185,36 @@ impl PricingLookup {
             }
         }
         None
+    }
+
+    /// [`exact_match_openrouter_for_provider`], retrying the
+    /// separator-normalized spelling when the raw one finds nothing.
+    ///
+    /// OpenRouter dots minor versions (`anthropic/claude-haiku-4.5`) where
+    /// LiteLLM and callers hyphenate (`claude-haiku-4-5`). The provider-scoped
+    /// exact stages below compare raw spellings and return early, so without
+    /// this retry a hint-matching reseller LiteLLM row can win the stage
+    /// outright while OpenRouter's first-party entry — the one the hint
+    /// actually names — never participates in arbitration at all (#1329).
+    fn exact_or_normalized_openrouter_for_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.exact_match_openrouter_for_provider(model_id, provider_id) {
+            return Some(result);
+        }
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            if let Some(result) =
+                self.exact_match_openrouter_for_provider(&version_normalized, provider_id)
+            {
+                return Some(result.with_normalization());
+            }
+        }
+        normalize_model_name(model_id).and_then(|normalized| {
+            self.exact_match_openrouter_for_provider(&normalized, provider_id)
+                .map(LookupResult::with_normalization)
+        })
     }
 
     fn lookup_models_dev_only(
@@ -1770,6 +1800,28 @@ impl PricingLookup {
         model_id: &str,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        if let Some(result) = self.fuzzy_match_openrouter_spelling(model_id, provider_id) {
+            return Some(result);
+        }
+        // OpenRouter spells some minor versions with a dot where LiteLLM and
+        // callers hyphenate (`anthropic/claude-haiku-4.5` vs
+        // `claude-haiku-4-5`), and `contains_model_id` is a literal find, so
+        // the pass above never sees those keys. Retry the same fuzzy passes
+        // against the normalized spelling before giving up, the way the exact
+        // passes already do (#1329).
+        if let Some(version_normalized) = normalize_version_separator(model_id) {
+            return self
+                .fuzzy_match_openrouter_spelling(&version_normalized, provider_id)
+                .map(|result| result.with_normalization());
+        }
+        None
+    }
+
+    fn fuzzy_match_openrouter_spelling(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
         let family = extract_model_family(model_id);
         let mut family_matches_list: Vec<&String> = Vec::new();
 
@@ -1825,6 +1877,7 @@ impl PricingLookup {
             output,
             cache_read,
             cache_write,
+            cache_write_1h: 0,
             reasoning,
         };
         self.calculate_cost_with_provider(model_id, None, &usage)
@@ -1859,7 +1912,12 @@ impl PricingLookup {
     /// Only buckets the hinted row cannot price are filled, so a reseller row
     /// keeps its own markup rather than silently repricing to the author's
     /// cheaper rate. If the filled row still cannot cover the usage, the
-    /// hinted row is returned unchanged and the usage stays unpriced.
+    /// hinted row is returned unchanged and the usage stays unpriced. A row
+    /// that covers the usage at the 5-minute cache-write rate but omits the
+    /// 1-hour rate still falls through to the canonical borrow below, so a
+    /// provider-scoped row (OpenRouter never publishes the 1-hour rate) can
+    /// pick up the canonical row's `cache_creation_input_token_cost_above_1hr`
+    /// instead of silently under-pricing every 1-hour cache write.
     pub(super) fn resolve_for_usage(
         &self,
         model_id: &str,
@@ -1867,7 +1925,12 @@ impl PricingLookup {
         usage: &TokenBreakdown,
     ) -> Option<LookupResult> {
         let hinted = self.lookup_with_provider(model_id, provider_id)?;
-        if normalize_provider_hint(provider_id).is_none() || hinted.pricing.covers_usage(usage) {
+        if normalize_provider_hint(provider_id).is_none() {
+            return Some(hinted);
+        }
+        if hinted.pricing.covers_usage(usage)
+            && !hinted.pricing.lacks_1h_cache_write_rate_for(usage)
+        {
             return Some(hinted);
         }
 
@@ -1884,6 +1947,9 @@ impl PricingLookup {
             .pricing
             .with_missing_rates_from(&canonical.pricing, usage);
         if !filled.covers_usage(usage) {
+            return Some(hinted);
+        }
+        if hinted.pricing.covers_usage(usage) && filled.lacks_1h_cache_write_rate_for(usage) {
             return Some(hinted);
         }
 
@@ -1967,6 +2033,10 @@ fn is_openai_full_request_272k_model(model_id: &str) -> bool {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+        "gpt-6-luna",
     ]
     .into_iter()
     .any(|base| matches_model_or_snapshot(model_id, base))
@@ -2091,6 +2161,8 @@ fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option
     let has_cache_write_pricing = [
         pricing.cache_creation_input_token_cost,
         pricing.cache_creation_input_token_cost_above_200k_tokens,
+        pricing.cache_creation_input_token_cost_above_1hr,
+        pricing.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
     ]
     .into_iter()
     .any(|rate| rate.is_some_and(is_valid_price_value));
@@ -2125,6 +2197,7 @@ fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakd
         usage.output,
         usage.cache_read,
         usage.cache_write,
+        usage.cache_write_1h,
         usage.reasoning,
     )
 }
@@ -2141,6 +2214,7 @@ fn compute_cost_for_lookup(
             usage.output,
             usage.cache_read,
             usage.cache_write,
+            usage.cache_write_1h,
             usage.reasoning,
         )
     };
@@ -2230,6 +2304,7 @@ pub fn compute_cost(
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    cache_write_1h: i64,
     reasoning: i64,
 ) -> f64 {
     let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
@@ -2264,6 +2339,8 @@ pub fn compute_cost(
     let output_clamped = output.max(0).saturating_add(reasoning.max(0)) as f64;
     let cache_read_clamped = cache_read.max(0) as f64;
     let cache_write_clamped = cache_write.max(0) as f64;
+    let cache_write_1h_clamped = cache_write_1h.max(0).min(cache_write.max(0)) as f64;
+    let cache_write_5m_clamped = cache_write_clamped - cache_write_1h_clamped;
 
     let input_cost = tiered_cost(
         input_clamped,
@@ -2333,16 +2410,56 @@ pub fn compute_cost(
             ),
         ],
     );
-    let cache_write_cost = tiered_cost(
-        cache_write_clamped,
-        pricing.cache_creation_input_token_cost,
-        &[(
-            TIERED_PRICING_THRESHOLD_200K_TOKENS,
-            pricing.cache_creation_input_token_cost_above_200k_tokens,
-        )],
-    );
+    // Without any published 1-hour rate the whole amount shares one 200k
+    // tier boundary (the pre-split contract, pinned by
+    // `test_compute_cost_without_1h_rate_tiers_the_combined_cache_write_once`).
+    // A row that publishes only the 1-hour high tier still gets hourly
+    // treatment: the ordinary cache-write base stands in for the absent
+    // 1-hour base, so the first 200k hourly tokens are not charged at zero
+    // while the published high tier applies above it (#1374 review).
+    let hourly_high = pricing
+        .cache_creation_input_token_cost_above_1hr_above_200k_tokens
+        .filter(|rate| is_valid_price_value(*rate));
+    let hourly_base = pricing
+        .cache_creation_input_token_cost_above_1hr
+        .filter(|rate| is_valid_price_value(*rate))
+        .or_else(|| {
+            hourly_high?;
+            pricing
+                .cache_creation_input_token_cost
+                .filter(|rate| is_valid_price_value(*rate))
+        });
+    let (cache_write_5m_cost, cache_write_1h_cost) = if hourly_base.is_some() {
+        let five_minute = tiered_cost(
+            cache_write_5m_clamped,
+            pricing.cache_creation_input_token_cost,
+            &[(
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.cache_creation_input_token_cost_above_200k_tokens,
+            )],
+        );
+        let one_hour = tiered_cost(
+            cache_write_1h_clamped,
+            hourly_base,
+            &[(
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
+            )],
+        );
+        (five_minute, one_hour)
+    } else {
+        let whole = tiered_cost(
+            cache_write_clamped,
+            pricing.cache_creation_input_token_cost,
+            &[(
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.cache_creation_input_token_cost_above_200k_tokens,
+            )],
+        );
+        (whole, 0.0)
+    };
 
-    input_cost + output_cost + cache_read_cost + cache_write_cost
+    input_cost + output_cost + cache_read_cost + cache_write_5m_cost + cache_write_1h_cost
 }
 
 fn extract_model_family(model_id: &str) -> String {
@@ -3441,6 +3558,16 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
 }
 
+/// The standard GPT model a `gpt-<version>-fast` terminal id names, or `None`
+/// when the id is not an OpenAI Fast-mode alias. Shared by price resolution
+/// (`normalize_openai_fast_mode`) and premium inference
+/// (`has_openai_gpt_fast_suffix` in lib.rs) so the two cannot drift on what
+/// counts as a Fast alias.
+pub(crate) fn openai_gpt_fast_base(terminal: &str) -> Option<&str> {
+    let base = terminal.strip_suffix("-fast")?;
+    (base.starts_with("gpt-") && base.len() > "gpt-".len()).then_some(base)
+}
+
 /// Strip OpenAI's request-speed mode from the model identity.
 ///
 /// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
@@ -3463,10 +3590,7 @@ fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Opti
         .map_or((None, model_id), |(prefix, terminal)| {
             (Some(prefix), terminal)
         });
-    let base = terminal.strip_suffix("-fast")?;
-    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
-        return None;
-    }
+    let base = openai_gpt_fast_base(terminal)?;
 
     Some(match prefix {
         Some(prefix) => format!("{prefix}/{base}"),
@@ -4622,6 +4746,7 @@ mod tests {
             output: 1,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
 
@@ -6665,6 +6790,7 @@ mod tests {
             output: 50,
             cache_read: 20,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
 
@@ -6731,6 +6857,7 @@ mod tests {
             output: 50,
             cache_read: 20,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
 
@@ -6741,6 +6868,209 @@ mod tests {
         assert_eq!(resolved.pricing.cache_read_input_token_cost, Some(5e-7));
         assert!(resolved.evidence.is_submission_safe());
         assert!(resolved.pricing.covers_usage(&usage));
+    }
+
+    fn lookup_with_claude_fable_5_1(
+        hinted: ModelPricing,
+        canonical: ModelPricing,
+    ) -> PricingLookup {
+        let litellm = HashMap::from([
+            ("azure_ai/claude-fable-5-1".to_string(), hinted),
+            ("claude-fable-5-1".to_string(), canonical),
+        ]);
+        PricingLookup::new(litellm, HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn resolve_for_usage_borrows_the_1hr_cache_write_rate_only_when_usage_has_a_1hr_write() {
+        let lookup = lookup_with_claude_fable_5_1(
+            ModelPricing {
+                input_cost_per_token: Some(1e-05),
+                output_cost_per_token: Some(5e-05),
+                cache_creation_input_token_cost: Some(1.25e-05),
+                ..Default::default()
+            },
+            ModelPricing {
+                input_cost_per_token: Some(1e-05),
+                output_cost_per_token: Some(5e-05),
+                cache_creation_input_token_cost: Some(1.25e-05),
+                cache_creation_input_token_cost_above_1hr: Some(2e-05),
+                ..Default::default()
+            },
+        );
+
+        let usage_with_1hr_write = TokenBreakdown {
+            cache_write: 200_000,
+            cache_write_1h: 100_000,
+            ..Default::default()
+        };
+        let resolved = lookup
+            .resolve_for_usage("claude-fable-5-1", Some("azure"), &usage_with_1hr_write)
+            .expect("the hinted row resolves");
+        assert_eq!(
+            resolved.pricing.cache_creation_input_token_cost_above_1hr,
+            Some(2e-05),
+            "the hinted row must borrow the canonical row's 1-hour rate"
+        );
+        let cost = lookup.calculate_cost_with_provider(
+            "claude-fable-5-1",
+            Some("azure"),
+            &usage_with_1hr_write,
+        );
+        assert!((cost - 3.25).abs() < 1e-9, "cost was {cost}");
+
+        let usage_without_1hr_write = TokenBreakdown {
+            cache_write: 200_000,
+            ..Default::default()
+        };
+        let resolved = lookup
+            .resolve_for_usage("claude-fable-5-1", Some("azure"), &usage_without_1hr_write)
+            .expect("the hinted row resolves");
+        assert_eq!(resolved.matched_key, "azure_ai/claude-fable-5-1");
+        assert_eq!(
+            resolved.pricing.cache_creation_input_token_cost_above_1hr,
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_for_usage_does_not_borrow_a_paid_1hr_rate_for_an_all_zero_hinted_row() {
+        let lookup = lookup_with_claude_fable_5_1(
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_creation_input_token_cost: Some(0.0),
+                ..Default::default()
+            },
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_creation_input_token_cost: Some(0.0),
+                cache_creation_input_token_cost_above_1hr: Some(2e-05),
+                ..Default::default()
+            },
+        );
+        let usage = TokenBreakdown {
+            cache_write: 100_000,
+            cache_write_1h: 100_000,
+            ..Default::default()
+        };
+
+        let resolved = lookup
+            .resolve_for_usage("claude-fable-5-1", Some("azure"), &usage)
+            .expect("the hinted row resolves");
+        assert_eq!(
+            resolved.pricing.cache_creation_input_token_cost_above_1hr, None,
+            "an all-zero hinted row must not borrow the canonical row's paid 1-hour rate"
+        );
+
+        let cost = lookup.calculate_cost_with_provider("claude-fable-5-1", Some("azure"), &usage);
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn resolve_for_usage_keeps_the_hinted_row_when_the_ambiguous_canonical_row_also_lacks_a_1hr_rate(
+    ) {
+        let disputed_cache_read_row = |cache_read: f64| ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            cache_creation_input_token_cost: Some(1.25e-6),
+            cache_read_input_token_cost: Some(cache_read),
+            ..Default::default()
+        };
+        let litellm = HashMap::from([
+            (
+                "azure_ai/claude-fable-5-1".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    cache_creation_input_token_cost: Some(1.25e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vendor-a/claude-fable-5-1-preview".to_string(),
+                disputed_cache_read_row(5e-7),
+            ),
+            (
+                "vendor-b/claude-fable-5-1-beta".to_string(),
+                disputed_cache_read_row(9e-7),
+            ),
+        ]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            cache_write: 100_000,
+            cache_write_1h: 50_000,
+            ..Default::default()
+        };
+
+        let hinted = lookup
+            .lookup_with_provider("claude-fable-5-1", Some("azure"))
+            .expect("the provider-hinted row resolves deterministically");
+        assert!(hinted.pricing.covers_usage(&usage));
+        assert!(hinted.evidence.is_submission_safe());
+
+        let canonical = lookup
+            .lookup_with_provider("claude-fable-5-1", None)
+            .expect("the unhinted lookup falls back to a fuzzy estimate");
+        assert!(!canonical.evidence.is_submission_safe());
+        assert_eq!(
+            canonical.pricing.cache_creation_input_token_cost_above_1hr,
+            None
+        );
+
+        let resolved = lookup
+            .resolve_for_usage("claude-fable-5-1", Some("azure"), &usage)
+            .expect("the hinted row still resolves");
+
+        assert_eq!(resolved.matched_key, hinted.matched_key);
+        assert_eq!(resolved.evidence, hinted.evidence);
+        assert_eq!(
+            resolved.pricing.cache_creation_input_token_cost_above_1hr,
+            None
+        );
+    }
+
+    #[test]
+    fn compute_cost_applies_a_high_only_hourly_tier_with_the_ordinary_base() {
+        // A row that publishes only the 1-hour above-200k tier (no plain
+        // 1-hour base) used to charge everything through the 5-minute path,
+        // silently ignoring the published hourly high tier. The ordinary
+        // cache-write base stands in for the missing 1-hour base so the
+        // first 200k hourly tokens are not free (#1374 review).
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(1e-5),
+            cache_creation_input_token_cost: Some(3.75e-6),
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: Some(12e-6),
+            ..Default::default()
+        };
+        let cost = compute_cost(&pricing, 0, 0, 0, 300_000, 300_000, 0);
+        let expected = 200_000.0 * 3.75e-6 + 100_000.0 * 12e-6;
+        assert!((cost - expected).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn compute_cost_tiers_each_ttl_bucket_against_its_own_200k_boundary() {
+        // Pins the per-bucket semantics: the 5-minute remainder and the
+        // 1-hour subset each cross the 200k progressive boundary
+        // independently, matching the generic per-bucket tiering contract
+        // used for every other rate. A combined boundary for the summed
+        // cache writes would charge the first 250k of this example at base
+        // rates and only the remainder at high rates, which is a different
+        // (request-wide) contract than the one applied here.
+        let pricing = ModelPricing {
+            cache_creation_input_token_cost: Some(3.75e-6),
+            cache_creation_input_token_cost_above_200k_tokens: Some(7.5e-6),
+            cache_creation_input_token_cost_above_1hr: Some(6e-6),
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens: Some(12e-6),
+            ..Default::default()
+        };
+        // 250k 5-minute + 250k 1-hour writes.
+        let cost = compute_cost(&pricing, 0, 0, 0, 500_000, 250_000, 0);
+        let expected =
+            (200_000.0 * 3.75e-6 + 50_000.0 * 7.5e-6) + (200_000.0 * 6e-6 + 50_000.0 * 12e-6);
+        assert!((cost - expected).abs() < 1e-9, "cost was {cost}");
     }
 
     #[test]
@@ -6974,7 +7304,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_000, 200_000, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_000, 200_000, 0, 0, 0, 0);
         let expected = 200_000.0 * 0.000001 + 200_000.0 * 0.000003;
 
         assert!((cost - expected).abs() < 1e-12);
@@ -6992,7 +7322,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_001, 200_001, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_001, 200_001, 0, 0, 0, 0);
         let expected =
             (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003 + 1.0 * 0.000004);
 
@@ -7013,7 +7343,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0);
+        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0, 0);
         let expected = (272_000.0 * 0.000005 + 1.0 * 0.000010)
             + (272_000.0 * 0.000030 + 1.0 * 0.000045)
             + (272_000.0 * 0.0000005 + 1.0 * 0.000001);
@@ -7033,7 +7363,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0);
+        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0, 0);
         let expected = (128_000.0 * 0.000001)
             + (128_000.0 * 0.000002)
             + (16_000.0 * 0.000003)
@@ -7213,6 +7543,7 @@ mod tests {
             output,
             cache_read,
             cache_write,
+            cache_write_1h: 0,
             reasoning: 0,
         };
         let cost =
@@ -7329,20 +7660,21 @@ mod tests {
 
     #[test]
     fn openai_272k_preference_still_prefers_complete_litellm_pricing() {
-        let litellm_pricing = openai_272k_result("gpt-5.6-sol", "LiteLLM").pricing;
-        let openrouter_pricing = openai_272k_result("openai/gpt-5.6-sol", "OpenRouter").pricing;
+        for model in ["gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] {
+            let litellm_pricing = openai_272k_result(model, "LiteLLM").pricing;
+            let openrouter_key = format!("openai/{model}");
+            let openrouter_pricing = openai_272k_result(&openrouter_key, "OpenRouter").pricing;
 
-        let lookup = PricingLookup::new(
-            HashMap::from([("gpt-5.6-sol".into(), litellm_pricing)]),
-            HashMap::from([("openai/gpt-5.6-sol".into(), openrouter_pricing)]),
-            HashMap::new(),
-        );
+            let lookup = PricingLookup::new(
+                HashMap::from([(model.into(), litellm_pricing)]),
+                HashMap::from([(openrouter_key, openrouter_pricing)]),
+                HashMap::new(),
+            );
 
-        let result = lookup
-            .lookup_with_provider("gpt-5.6-sol", Some("openai"))
-            .unwrap();
-        assert_eq!(result.source, "LiteLLM");
-        assert_eq!(result.matched_key, "gpt-5.6-sol");
+            let result = lookup.lookup_with_provider(model, Some("openai")).unwrap();
+            assert_eq!(result.source, "LiteLLM", "wrong source for {model}");
+            assert_eq!(result.matched_key, model);
+        }
     }
 
     #[test]
@@ -7357,6 +7689,16 @@ mod tests {
             "gpt-5.6-sol",
             "gpt-5.6-terra-2026-07-01",
             "gpt-5.6-luna",
+            "gpt-6-astra",
+            "openai/gpt-6-astra",
+            "gpt-6-astra-2026-09-03",
+            "gpt-6-sol",
+            "openai/gpt-6-sol",
+            "gpt-6.1-sol",
+            "openai/gpt-6.1-sol",
+            "gpt-6.1-sol-2026-09-29",
+            "gpt-6-luna",
+            "openai/gpt-6-luna",
         ] {
             assert!(
                 uses_openai_full_request_272k_pricing(
@@ -7432,6 +7774,175 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_applies_full_request_pricing_above_272k_threshold() {
+        let result = LookupResult {
+            matched_key: "gpt-6-astra".into(),
+            source: "LiteLLM".into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000010),
+                input_cost_per_token_above_272k_tokens: Some(0.000020),
+                output_cost_per_token: Some(0.000050),
+                output_cost_per_token_above_272k_tokens: Some(0.000075),
+                cache_read_input_token_cost: Some(0.000001),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000002),
+                cache_creation_input_token_cost: Some(0.0000125),
+                ..Default::default()
+            },
+        };
+
+        let usage = |input, output, cache_read, cache_write| TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_1h: 0,
+            reasoning: 0,
+        };
+
+        // 1. Below or at 272k threshold: standard rates
+        let at_boundary =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(272_000, 10_000, 0, 0));
+        let expected_at_boundary = 272_000.0 * 0.000010 + 10_000.0 * 0.000050; // $3.22
+        assert!((at_boundary - expected_at_boundary).abs() < 1e-12);
+
+        // 2. 1 token above threshold: entire request billed at above-272k rates
+        let above_boundary =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(272_001, 10_000, 0, 0));
+        let expected_above_boundary = 272_001.0 * 0.000020 + 10_000.0 * 0.000075; // $6.19002
+        assert!((above_boundary - expected_above_boundary).abs() < 1e-12);
+
+        // 3. 300k uncached input + 10k output: reproduces issue #1279 example
+        let repro_case =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(300_000, 10_000, 0, 0));
+        let expected_repro = 300_000.0 * 0.000020 + 10_000.0 * 0.000075; // $6.75
+        assert!((repro_case - expected_repro).abs() < 1e-12);
+
+        // 4. Combined prompt tokens (250k input + 50k cache read) exceed 272k
+        let cache_case =
+            compute_cost_for_lookup(&result, Some("openai"), &usage(250_000, 10_000, 50_000, 0));
+        let expected_cache = 250_000.0 * 0.000020 + 10_000.0 * 0.000075 + 50_000.0 * 0.000002; // $5.85
+        assert!((cache_case - expected_cache).abs() < 1e-12);
+
+        // 5. Non-direct provider keeps progressive tiers
+        let azure_cost =
+            compute_cost_for_lookup(&result, Some("azure"), &usage(300_000, 10_000, 0, 0));
+        let expected_azure = (272_000.0 * 0.000010 + 28_000.0 * 0.000020) + (10_000.0 * 0.000050); // $3.78
+        assert!((azure_cost - expected_azure).abs() < 1e-12);
+
+        // 6. Complete LiteLLM pricing preference is favored for openai provider
+        assert!(should_prefer_openai_tiered_litellm(
+            "gpt-6-astra",
+            Some("openai"),
+            Some(&result)
+        ));
+        assert!(!should_prefer_openai_tiered_litellm(
+            "gpt-6-astra",
+            Some("azure"),
+            Some(&result)
+        ));
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_apply_full_request_pricing_above_272k_threshold() {
+        let cases = [
+            // Official Standard rates per million tokens: input, output,
+            // cache read, cache write; followed by the >272K full-request rates.
+            (
+                "gpt-6-sol",
+                2e-6,
+                10e-6,
+                0.2e-6,
+                2.5e-6,
+                4e-6,
+                15e-6,
+                0.4e-6,
+                5e-6,
+            ),
+            (
+                "gpt-6.1-sol",
+                2e-6,
+                10e-6,
+                0.1e-6,
+                2.5e-6,
+                4e-6,
+                15e-6,
+                0.2e-6,
+                5e-6,
+            ),
+            (
+                "gpt-6-luna",
+                0.1e-6,
+                0.5e-6,
+                0.01e-6,
+                0.125e-6,
+                0.2e-6,
+                0.75e-6,
+                0.02e-6,
+                0.25e-6,
+            ),
+        ];
+
+        for (
+            model,
+            input_rate,
+            output_rate,
+            cache_read_rate,
+            cache_write_rate,
+            long_input_rate,
+            long_output_rate,
+            long_cache_read_rate,
+            long_cache_write_rate,
+        ) in cases
+        {
+            let result = LookupResult {
+                matched_key: model.into(),
+                source: "LiteLLM".into(),
+                evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+                pricing: ModelPricing {
+                    input_cost_per_token: Some(input_rate),
+                    input_cost_per_token_above_272k_tokens: Some(long_input_rate),
+                    output_cost_per_token: Some(output_rate),
+                    output_cost_per_token_above_272k_tokens: Some(long_output_rate),
+                    cache_read_input_token_cost: Some(cache_read_rate),
+                    cache_read_input_token_cost_above_272k_tokens: Some(long_cache_read_rate),
+                    cache_creation_input_token_cost: Some(cache_write_rate),
+                    ..Default::default()
+                },
+            };
+            assert!(uses_openai_full_request_272k_pricing(
+                &result,
+                Some("openai")
+            ));
+
+            let at_threshold = TokenBreakdown {
+                input: 272_000,
+                ..Default::default()
+            };
+            let cost_at_threshold = compute_cost_for_lookup(&result, Some("openai"), &at_threshold);
+            assert!((cost_at_threshold - (272_000.0 * input_rate)).abs() < 1e-12);
+
+            let above_threshold = TokenBreakdown {
+                input: 272_001,
+                output: 10_000,
+                cache_read: 1_000,
+                cache_write: 500,
+                cache_write_1h: 0,
+                reasoning: 0,
+            };
+            let expected = 272_001.0 * long_input_rate
+                + 10_000.0 * long_output_rate
+                + 1_000.0 * long_cache_read_rate
+                + 500.0 * long_cache_write_rate;
+            let actual = compute_cost_for_lookup(&result, Some("openai"), &above_threshold);
+            assert!(
+                (actual - expected).abs() < 1e-12,
+                "wrong long-context cost for {model}"
+            );
+        }
+    }
+
+    #[test]
     fn test_compute_cost_tiered_is_applied_per_bucket() {
         let pricing: ModelPricing = serde_json::from_str(
             r#"{
@@ -7443,7 +7954,7 @@ mod tests {
         )
         .unwrap();
 
-        let cost = compute_cost(&pricing, 200_001, 200_000, 0, 0, 0);
+        let cost = compute_cost(&pricing, 200_001, 200_000, 0, 0, 0, 0);
         let expected = (200_000.0 * 0.000001 + 1.0 * 0.000002) + (200_000.0 * 0.000003);
 
         assert!((cost - expected).abs() < 1e-12);
@@ -7458,8 +7969,8 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 200_000, 0, 0, 0, 0);
-        let above_threshold = compute_cost(&pricing, 200_001, 0, 0, 0, 0);
+        let at_threshold = compute_cost(&pricing, 200_000, 0, 0, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 200_001, 0, 0, 0, 0, 0);
 
         assert_eq!(at_threshold, 0.0);
         assert!((above_threshold - 0.000002).abs() < 1e-12);
@@ -7475,8 +7986,8 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 0, 0, 200_000, 0, 0);
-        let above_threshold = compute_cost(&pricing, 0, 0, 200_001, 0, 0);
+        let at_threshold = compute_cost(&pricing, 0, 0, 200_000, 0, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 200_001, 0, 0, 0);
 
         assert!((at_threshold - (200_000.0 * 0.0000001)).abs() < 1e-12);
         assert!((above_threshold - (200_000.0 * 0.0000001 + 0.0000002)).abs() < 1e-12);
@@ -7492,11 +8003,41 @@ mod tests {
         )
         .unwrap();
 
-        let at_threshold = compute_cost(&pricing, 0, 0, 0, 200_000, 0);
-        let above_threshold = compute_cost(&pricing, 0, 0, 0, 200_001, 0);
+        let at_threshold = compute_cost(&pricing, 0, 0, 0, 200_000, 0, 0);
+        let above_threshold = compute_cost(&pricing, 0, 0, 0, 200_001, 0, 0);
 
         assert!((at_threshold - (200_000.0 * 0.0000003)).abs() < 1e-12);
         assert!((above_threshold - (200_000.0 * 0.0000003 + 0.0000004)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_prices_1h_cache_writes_at_the_1hr_rate() {
+        let pricing = ModelPricing {
+            input_cost_per_token: Some(1e-05),
+            cache_creation_input_token_cost: Some(1.25e-05),
+            cache_creation_input_token_cost_above_1hr: Some(2e-05),
+            ..Default::default()
+        };
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 200_000, 100_000, 0);
+
+        assert!((cost - 3.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_cost_without_1h_rate_tiers_the_combined_cache_write_once() {
+        let pricing = ModelPricing {
+            cache_creation_input_token_cost: Some(0.0000003),
+            cache_creation_input_token_cost_above_200k_tokens: Some(0.0000004),
+            ..Default::default()
+        };
+
+        let cost = compute_cost(&pricing, 0, 0, 0, 250_000, 150_000, 0);
+
+        assert!(
+            (cost - 0.080).abs() < 1e-12,
+            "expected the pre-split 0.080, got {cost}"
+        );
     }
 
     #[test]
@@ -7506,7 +8047,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cost = compute_cost(&pricing, 250_000, 0, 0, 0, 0);
+        let cost = compute_cost(&pricing, 250_000, 0, 0, 0, 0, 0);
 
         assert!((cost - (250_000.0 * 0.000001)).abs() < 1e-12);
     }
@@ -7530,9 +8071,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.000001;
-        assert!((compute_cost(&pricing_negative, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 200_001, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 200_001, 0, 0, 0, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -7543,7 +8084,7 @@ mod tests {
             ..Default::default()
         };
 
-        let cost = compute_cost(&pricing, 0, 199_999, 0, 0, 1);
+        let cost = compute_cost(&pricing, 0, 199_999, 0, 0, 0, 1);
         let expected = 200_000.0 * 0.000003;
 
         assert!((cost - expected).abs() < 1e-12);
@@ -7568,9 +8109,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.000003;
-        assert!((compute_cost(&pricing_negative, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 199_999, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 199_999, 0, 0, 0, 2) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -7592,9 +8133,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.0000001;
-        assert!((compute_cost(&pricing_negative, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 200_001, 0, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -7616,9 +8157,9 @@ mod tests {
         };
 
         let expected = 200_001.0 * 0.0000003;
-        assert!((compute_cost(&pricing_negative, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_infinite, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
-        assert!((compute_cost(&pricing_nan, 0, 0, 0, 200_001, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_negative, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_infinite, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
+        assert!((compute_cost(&pricing_nan, 0, 0, 0, 200_001, 0, 0) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -7938,6 +8479,87 @@ mod tests {
         assert_eq!(result.matched_key, "claude-opus-4-6-20250301");
         assert_eq!(result.source, "LiteLLM");
         assert!(result.pricing.input_cost_per_token.is_some());
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_crosses_version_separator_difference() {
+        // OpenRouter keys dot-separated minors (`claude-haiku-4.5`) where the
+        // caller hyphenates (`claude-haiku-4-5`), so a literal `contains`
+        // never pairs them and OpenRouter dropped out of arbitration — with an
+        // `anthropic` hint the reseller LiteLLM entry won and priced cache
+        // writes at zero (#1329).
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "perplexity/anthropic/claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                cache_creation_input_token_cost: Some(0.00000125),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        // Provider-hinted: OpenRouter's first-party key must participate and
+        // win arbitration over the hint-matching reseller LiteLLM entry.
+        let result = lookup
+            .lookup_with_provider("claude-haiku-4-5", Some("anthropic"))
+            .expect("normalized OpenRouter entry should participate in arbitration");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
+        assert!(result.evidence.normalized);
+
+        // The promoted entry carries the cache-write rate the reseller lacks.
+        let cost = lookup.calculate_cost_with_provider(
+            "claude-haiku-4-5",
+            Some("anthropic"),
+            &TokenBreakdown {
+                input: 1_000,
+                output: 1_000,
+                cache_read: 0,
+                cache_write: 1_000,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+        );
+        assert!(
+            cost > 0.001,
+            "cache writes should price above zero, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_openrouter_version_separator_without_hint() {
+        // Unhinted lookups hit the same wall: without any LiteLLM entry the
+        // dotted OpenRouter key is the only candidate, and the literal
+        // `contains` hid it entirely.
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "anthropic/claude-haiku-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000005),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup("claude-haiku-4-5")
+            .expect("fuzzy match should reach the dotted OpenRouter key");
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "anthropic/claude-haiku-4.5");
     }
 
     #[test]
@@ -8488,6 +9110,7 @@ mod tests {
             output: 100,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: 0,
         };
 

@@ -66,6 +66,16 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     ClientUi { hotkey: 'U' },
     // Hindsight: uppercase 'H' stays mnemonic while lowercase 'h' belongs to Crush.
     ClientUi { hotkey: 'H' },
+    // Xiaomi MiMo AI desktop: uppercase 'W' stays free; lowercase letters for
+    // "MiMo"/"desktop" are already taken by MiMo Code / Crush / Mux.
+    ClientUi { hotkey: 'W' },
+    // Muse: both cases of `m` are taken (MiMo Code / Mcode), `u` belongs to
+    // Grok Build, `s` is the global "sources" picker binding and `e` belongs
+    // to Hermes, so `N` takes the next free letter.
+    ClientUi { hotkey: 'N' },
+    // Antigravity IDE Extensions: uppercase `I` keeps the extension distinct
+    // from the existing lowercase `i` hotkey for Kiro.
+    ClientUi { hotkey: 'I' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {
@@ -79,6 +89,7 @@ pub fn compact_display_name(client: ClientId) -> &'static str {
         ClientId::Senpi => "Senpi",
         // "DeepSeek Harness" (16 cells) overflows the 15-cell Client column.
         ClientId::Dsh => "DeepSeek",
+        ClientId::AntigravityExtension => "Antigravity Ext",
         _ => display_name(client),
     }
 }

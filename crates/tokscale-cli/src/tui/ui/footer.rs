@@ -2,12 +2,14 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::spinner::{get_phase_message, get_scanner_spans};
-use super::widgets::{format_cost, format_tokens};
+use super::widgets::{format_cost, format_tokens, AMBIENT_STABLE_BORDER_SET};
 use crate::tui::app::{App, ClickAction, SortField, Tab};
+use crate::tui::i18n::{format_count, tr, MessageKey, TuiLanguage};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -44,6 +46,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
+    let lang = app.settings.tui_language;
     let is_very_narrow = app.is_very_narrow();
 
     // Split into left (sort buttons) and right (totals)
@@ -57,13 +60,17 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut spans: Vec<Span> = Vec::new();
         let mut x_offset = chunks[0].x;
 
-        spans.push(Span::styled("Sort: ", Style::default().fg(app.theme.muted)));
-        x_offset += 6;
+        let sort_label = tr(lang, MessageKey::SortLabel);
+        spans.push(Span::styled(
+            sort_label,
+            Style::default().fg(app.theme.muted),
+        ));
+        x_offset += unicode_width::UnicodeWidthStr::width(sort_label) as u16;
 
         let sort_buttons = [
-            (SortField::Date, "Date"),
-            (SortField::Cost, "Cost"),
-            (SortField::Tokens, "Tokens"),
+            (SortField::Date, tr(lang, MessageKey::SortDate)),
+            (SortField::Cost, tr(lang, MessageKey::SortCost)),
+            (SortField::Tokens, tr(lang, MessageKey::SortTokens)),
         ];
 
         for (field, label) in sort_buttons {
@@ -79,7 +86,7 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
 
-            let btn_width = label.len() as u16;
+            let btn_width = unicode_width::UnicodeWidthStr::width(label) as u16;
             app.add_click_area(
                 Rect::new(x_offset, chunks[0].y, btn_width, 1),
                 ClickAction::Sort(field),
@@ -102,8 +109,15 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
             let start = app.scroll_offset + 1;
             let end = (app.scroll_offset + app.max_visible_items).min(total_models);
             if !is_very_narrow {
+                let scroll_text = match lang {
+                    TuiLanguage::Ko => format!("↓ {}-{} (총 {}개) ", start, end, total_models),
+                    TuiLanguage::Ja => format!("↓ {}-{} (全{}件) ", start, end, total_models),
+                    TuiLanguage::ZhCn => format!("↓ {}-{} (共{}项) ", start, end, total_models),
+                    TuiLanguage::Fr => format!("↓ {}-{} sur {} ", start, end, total_models),
+                    TuiLanguage::En => format!("↓ {}-{} of {} ", start, end, total_models),
+                };
                 right_spans.push(Span::styled(
-                    format!("↓ {}-{} of {} ", start, end, total_models),
+                    scroll_text,
                     Style::default().fg(app.theme.muted),
                 ));
                 right_spans.push(Span::styled("| ", Style::default().fg(app.theme.muted)));
@@ -115,11 +129,11 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_tokens = app.data.total_tokens;
     right_spans.push(Span::styled(
         format_tokens(total_tokens),
-        Style::default().fg(Color::Cyan),
+        app.theme.count_style(),
     ));
     if !is_very_narrow {
         right_spans.push(Span::styled(
-            " tokens",
+            tr(lang, MessageKey::FooterTokens),
             Style::default().fg(app.theme.muted),
         ));
     }
@@ -149,26 +163,41 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn current_count_label(app: &App) -> String {
+    let lang = app.settings.tui_language;
     match app.current_tab {
-        Tab::Overview | Tab::Models => format!(" ({} models)", app.data.models.len()),
-        Tab::Agents => format!(" ({} agents)", app.data.agents.len()),
-        Tab::Daily if app.is_daily_detail_active() => {
-            format!(" ({} models)", app.get_sorted_daily_detail_rows().len())
+        Tab::Models if app.is_model_trend_active() => format_count(
+            lang,
+            app.get_sorted_model_trend_rows().len(),
+            MessageKey::CountDays,
+        ),
+        Tab::Overview | Tab::Models => {
+            format_count(lang, app.data.models.len(), MessageKey::CountModels)
         }
-        Tab::Daily => format!(" ({} days)", app.data.daily.len()),
-        Tab::Hourly => format!(" ({} hours)", app.data.hourly.len()),
-        Tab::Minutely => format!(" ({} minutes)", app.data.minutely.len()),
-        Tab::Monthly if app.is_monthly_detail_active() => {
-            format!(" ({} days)", app.get_sorted_monthly_detail_days().len())
-        }
-        Tab::Monthly => format!(" ({} months)", app.data.monthly.len()),
-        Tab::Sessions => format!(" ({} sessions)", app.data.sessions.len()),
+        Tab::Agents => format_count(lang, app.data.agents.len(), MessageKey::CountAgents),
+        Tab::Daily if app.is_daily_detail_active() => format_count(
+            lang,
+            app.get_sorted_daily_detail_rows().len(),
+            MessageKey::CountModels,
+        ),
+        Tab::Daily => format_count(lang, app.data.daily.len(), MessageKey::CountDays),
+        Tab::Hourly => format_count(lang, app.data.hourly.len(), MessageKey::CountHours),
+        Tab::Minutely => format_count(lang, app.data.minutely.len(), MessageKey::CountMinutes),
+        Tab::Monthly if app.is_monthly_detail_active() => format_count(
+            lang,
+            app.get_sorted_monthly_detail_days().len(),
+            MessageKey::CountDays,
+        ),
+        Tab::Monthly => format_count(lang, app.data.monthly.len(), MessageKey::CountMonths),
+        Tab::Sessions => format_count(lang, app.active_sessions().len(), MessageKey::CountSessions),
+        Tab::Projects => format_count(lang, app.data.projects.len(), MessageKey::CountProjects),
         Tab::Stats | Tab::Usage => String::new(),
     }
 }
 
 fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
     let is_very_narrow = app.is_very_narrow();
+    let hint_style = app.theme.hint_key_style();
+    let count_style = app.theme.count_style();
 
     let spans = if is_very_narrow {
         let mut spans = vec![
@@ -178,96 +207,115 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("d/t/c", Style::default().fg(Color::Blue)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[s]", Style::default().fg(Color::Cyan)),
+            Span::styled("[s]", count_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[g]", Style::default().fg(Color::Cyan)),
+            Span::styled("[g]", count_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("[p]", Style::default().fg(Color::Magenta)),
             Span::styled("·", Style::default().fg(app.theme.muted)),
-            Span::styled("[r]", Style::default().fg(Color::Yellow)),
+            Span::styled("[r]", hint_style),
             Span::styled("·", Style::default().fg(app.theme.muted)),
             Span::styled("q", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             if app.is_daily_detail_active() {
-                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("esc", hint_style));
             } else {
-                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("↵", hint_style));
                 spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
-                spans.push(Span::styled("j", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("j", hint_style));
             }
         }
         if app.current_tab == Tab::Monthly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             if app.is_monthly_detail_active() {
-                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("esc", hint_style));
             } else {
-                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("↵", hint_style));
+            }
+        }
+        if app.current_tab == Tab::Models {
+            spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+            if app.is_model_trend_active() {
+                spans.push(Span::styled("esc", hint_style));
+            } else {
+                spans.push(Span::styled("↵", hint_style));
             }
         }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
-            spans.push(Span::styled("v", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("v", hint_style));
+        }
+        if app.current_tab == Tab::Sessions {
+            spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+            spans.push(Span::styled("b", hint_style));
         }
         spans
     } else {
+        let lang = app.settings.tui_language;
         let mut spans = vec![
             Span::styled(
-                "↑↓ scroll • ←→/tab view • ",
+                format!("{} • ", tr(lang, MessageKey::HelpScroll)),
                 Style::default().fg(app.theme.muted),
             ),
-            Span::styled("[d/t/c:sort]", Style::default().fg(Color::Blue)),
+            Span::styled(
+                tr(lang, MessageKey::HelpSort),
+                Style::default().fg(Color::Blue),
+            ),
             Span::styled(" • ", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
             if app.is_daily_detail_active() {
-                spans.push(Span::styled(
-                    "[esc:back]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(tr(lang, MessageKey::HelpBack), hint_style));
             } else {
-                spans.push(Span::styled(
-                    "[enter:details]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(tr(lang, MessageKey::HelpDetails), hint_style));
                 spans.push(Span::styled(" ", Style::default()));
-                spans.push(Span::styled(
-                    "[j:today]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(tr(lang, MessageKey::HelpToday), hint_style));
             }
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
         if app.current_tab == Tab::Monthly {
             if app.is_monthly_detail_active() {
-                spans.push(Span::styled(
-                    "[esc:back]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(tr(lang, MessageKey::HelpBack), hint_style));
             } else {
-                spans.push(Span::styled(
-                    "[enter:details]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(tr(lang, MessageKey::HelpDetails), hint_style));
+            }
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
+        if app.current_tab == Tab::Models {
+            if app.is_model_trend_active() {
+                spans.push(Span::styled(tr(lang, MessageKey::HelpBack), hint_style));
+            } else {
+                spans.push(Span::styled(tr(lang, MessageKey::HelpDetails), hint_style));
             }
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
         if app.current_tab == Tab::Hourly {
+            spans.push(Span::styled(tr(lang, MessageKey::HelpProfile), hint_style));
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
+        if app.current_tab == Tab::Sessions {
             spans.push(Span::styled(
-                "[v:profile]",
-                Style::default().fg(Color::Yellow),
+                if app.roll_up_subagents {
+                    tr(lang, MessageKey::HelpRollupOn)
+                } else {
+                    tr(lang, MessageKey::HelpRollupOff)
+                },
+                count_style,
             ));
             spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
         }
+        spans.push(Span::styled(tr(lang, MessageKey::HelpSources), count_style));
+        spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
-            "[s:sources]",
-            Style::default().fg(Color::Cyan),
+            tr(lang, MessageKey::HelpLanguage),
+            count_style,
         ));
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             format!("[g:{}]", app.group_by.borrow()),
-            Style::default().fg(Color::Cyan),
+            count_style,
         ));
         // `w` only does anything under workspace grouping, so only advertise it there.
         if *app.group_by.borrow() == tokscale_core::GroupBy::WorkspaceModel {
@@ -277,7 +325,7 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
                     tokscale_core::WorktreeRollup::MergeIntoRepo => "[w:repos]",
                     tokscale_core::WorktreeRollup::Separate => "[w:worktrees]",
                 },
-                Style::default().fg(Color::Cyan),
+                count_style,
             ));
         }
         spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
@@ -299,12 +347,13 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             }),
         ));
         spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        spans.push(Span::styled(tr(lang, MessageKey::HelpRefresh), hint_style));
         spans.push(Span::styled(
-            "[r:refresh]",
-            Style::default().fg(Color::Yellow),
+            " • e • ",
+            Style::default().fg(app.theme.muted),
         ));
         spans.push(Span::styled(
-            " • e • q",
+            tr(lang, MessageKey::HelpQuit),
             Style::default().fg(app.theme.muted),
         ));
         spans
@@ -319,20 +368,34 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
 /// data is on screen, or "local+remote (N devices)" when server-side
 /// aggregated stats are available for cross-checking.
 fn data_source_label(app: &App) -> String {
+    let lang = app.settings.tui_language;
     match app.remote_stats {
         Some(ref remote) => {
             let devices = if remote.device_count == 1 {
-                "1 device".to_string()
+                tr(lang, MessageKey::StatusDevice).to_string()
             } else {
-                format!("{} devices", remote.device_count)
+                match lang {
+                    TuiLanguage::Ko => format!("{}대 기기", remote.device_count),
+                    TuiLanguage::Ja => format!("{}台のデバイス", remote.device_count),
+                    TuiLanguage::ZhCn => format!("{}台设备", remote.device_count),
+                    TuiLanguage::Fr => format!("{} appareils", remote.device_count),
+                    TuiLanguage::En => format!("{} devices", remote.device_count),
+                }
             };
-            format!("local+remote ({})", devices)
+            match lang {
+                TuiLanguage::Ko => format!("로컬+원격 ({})", devices),
+                TuiLanguage::Ja => format!("ローカル+リモート ({})", devices),
+                TuiLanguage::ZhCn => format!("本地+远程 ({})", devices),
+                TuiLanguage::Fr => format!("local+distant ({})", devices),
+                TuiLanguage::En => format!("local+remote ({})", devices),
+            }
         }
-        None => "local".to_string(),
+        None => tr(lang, MessageKey::StatusLocal).to_string(),
     }
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
+    let lang = app.settings.tui_language;
     let mut spans: Vec<Span> = Vec::new();
 
     // Always-visible data-source indicator, so it is clear whether the
@@ -346,7 +409,8 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(ref remote) = app.remote_stats {
         spans.push(Span::styled(
             format!(
-                " all devices: {} · {}",
+                "{}{} · {}",
+                tr(lang, MessageKey::StatusAllDevices),
                 format_tokens(remote.total_tokens),
                 format_cost(remote.total_cost)
             ),
@@ -360,13 +424,13 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         spans.extend(scanner_spans);
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            get_phase_message("parsing-sources"),
+            get_phase_message("parsing-sources", lang),
             Style::default().fg(app.theme.muted),
         ));
     } else if app.background_loading {
         if app.has_visible_data() {
             spans.push(Span::styled(
-                "Refreshing cached data in background...",
+                tr(lang, MessageKey::StatusRefreshingBackground),
                 Style::default().fg(app.theme.muted),
             ));
         } else {
@@ -374,7 +438,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             spans.extend(scanner_spans);
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                get_phase_message("parsing-sources"),
+                get_phase_message("parsing-sources", lang),
                 Style::default().fg(app.theme.muted),
             ));
         }
@@ -388,14 +452,32 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let elapsed = app.last_refresh.elapsed();
         let ago = if elapsed.as_secs() < 60 {
-            format!("{}s ago", elapsed.as_secs())
+            match lang {
+                TuiLanguage::Ko => format!("{}초 전", elapsed.as_secs()),
+                TuiLanguage::Ja => format!("{}秒前", elapsed.as_secs()),
+                TuiLanguage::ZhCn => format!("{}秒前", elapsed.as_secs()),
+                TuiLanguage::Fr => format!("il y a {}s", elapsed.as_secs()),
+                TuiLanguage::En => format!("{}s ago", elapsed.as_secs()),
+            }
         } else if elapsed.as_secs() < 3600 {
-            format!("{}m ago", elapsed.as_secs() / 60)
+            match lang {
+                TuiLanguage::Ko => format!("{}분 전", elapsed.as_secs() / 60),
+                TuiLanguage::Ja => format!("{}分前", elapsed.as_secs() / 60),
+                TuiLanguage::ZhCn => format!("{}分钟前", elapsed.as_secs() / 60),
+                TuiLanguage::Fr => format!("il y a {}m", elapsed.as_secs() / 60),
+                TuiLanguage::En => format!("{}m ago", elapsed.as_secs() / 60),
+            }
         } else {
-            format!("{}h ago", elapsed.as_secs() / 3600)
+            match lang {
+                TuiLanguage::Ko => format!("{}시간 전", elapsed.as_secs() / 3600),
+                TuiLanguage::Ja => format!("{}時間前", elapsed.as_secs() / 3600),
+                TuiLanguage::ZhCn => format!("{}小时前", elapsed.as_secs() / 3600),
+                TuiLanguage::Fr => format!("il y a {}h", elapsed.as_secs() / 3600),
+                TuiLanguage::En => format!("{}h ago", elapsed.as_secs() / 3600),
+            }
         };
         spans.push(Span::styled(
-            format!("Last updated: {}", ago),
+            format!("{}{}", tr(lang, MessageKey::StatusLastUpdated), ago),
             Style::default().fg(app.theme.muted),
         ));
 
@@ -430,7 +512,9 @@ mod tests {
             initial_tab: Some(tab),
             ..Default::default()
         };
-        App::new_with_cached_data(config, Some(UsageData::default())).unwrap()
+        let mut app = App::new_with_cached_data(config, Some(UsageData::default())).unwrap();
+        app.settings.tui_language = crate::tui::i18n::TuiLanguage::En;
+        app
     }
 
     #[test]

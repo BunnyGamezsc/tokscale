@@ -18,19 +18,19 @@
 //!
 //! Cache split. The two sidecars are read back differently because they sit at
 //! different scopes. `session.json` is per-session, so it is a related file of
-//! the snapshot's cache fingerprint ([`fx_session_meta_path`]) and a
+//! the snapshot's cache fingerprint (`fx_session_meta_path`) and a
 //! sidecar-only edit invalidates exactly that one entry. `index.json` is one
 //! file shared by every session, so it is deliberately *not* in any
 //! fingerprint — appending a new session to it would otherwise invalidate every
 //! other session's entry. Its title is resolved after the cache instead, by
-//! [`apply_session_titles`], which reads the index once per scan and writes the
+//! `apply_session_titles`, which reads the index once per scan and writes the
 //! title onto freshly parsed and cache-served messages alike. Titles are
 //! collected per sessions directory, because an fx session id is only unique
 //! within one `sessions/` tree.
 //!
 //! Cost provenance. `total_cost` is optional on the wire at both levels, so its
 //! presence is preserved rather than defaulted: a snapshot that never carried a
-//! cost must not be submitted as an authoritative $0.00. See [`reported_cost`].
+//! cost must not be submitted as an authoritative $0.00. See `reported_cost`.
 
 use super::utils::{file_modified_timestamp_ms, read_file_or_none};
 use super::{normalize_workspace_key, workspace_label_from_key, CostSource, UnifiedMessage};
@@ -306,6 +306,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             output: model_usage.output_tokens.max(0),
             cache_read: model_usage.cache_read_tokens.max(0),
             cache_write: model_usage.cache_write_tokens.max(0),
+            cache_write_1h: 0,
             reasoning: model_usage.reasoning_tokens.unwrap_or(0).max(0),
         };
         if tokens.total() == 0 {
@@ -336,6 +337,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             tokens,
             cost,
             cost_source,
+            service_tier: None,
             duration_ms: None,
             message_count: model_usage.request_count.unwrap_or(0).max(0) as i32,
             agent: None,
@@ -343,6 +345,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             // Resolved after the cache by `apply_session_titles`; see the
             // module docs for why the shared index stays out of the parse.
             session_title: None,
+            parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
         });
@@ -359,6 +362,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             output: snapshot.output_tokens.max(0),
             cache_read: snapshot.cache_read_tokens.max(0),
             cache_write: snapshot.cache_write_tokens.max(0),
+            cache_write_1h: 0,
             reasoning: snapshot.reasoning_tokens.unwrap_or(0).max(0),
         };
         let request_count = snapshot.request_count.unwrap_or(0).max(0);
@@ -376,11 +380,13 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 tokens,
                 cost,
                 cost_source,
+                service_tier: None,
                 duration_ms: None,
                 message_count: request_count as i32,
                 agent: None,
                 dedup_key: Some(format!("fx:{session_id}:{UNKNOWN_MODEL}")),
                 session_title: None,
+                parent_session_id: None,
                 is_turn_start: false,
                 model_attribution_conflicted: false,
             });
@@ -465,6 +471,7 @@ mod tests {
                 output: 441,
                 cache_read: 1069,
                 cache_write: 7,
+                cache_write_1h: 0,
                 reasoning: 3,
             }
         );
@@ -535,6 +542,7 @@ mod tests {
                 output: 800,
                 cache_read: 500,
                 cache_write: 10,
+                cache_write_1h: 0,
                 reasoning: 120,
             }
         );

@@ -22,6 +22,24 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
+/// Agents-tab bucket for a regular interactive Codex thread. Codex stamps each
+/// spawned thread with a random `agent_nickname` (a scientist/philosopher
+/// name), which is a per-session alias rather than a role, so the parser
+/// collapses them to a single name instead of letting every thread become its
+/// own Agents row.
+pub const CODEX_DEFAULT_AGENT: &str = "Codex";
+/// Agents-tab bucket for threads Codex started itself: any `source.subagent`
+/// variant, e.g. the `thread_spawn` workers of Ultra mode's orchestrated team.
+/// Guardian reviews have their own bucket.
+pub const CODEX_SUBAGENT_AGENT: &str = "Codex Subagent";
+/// Agents-tab bucket for guardian review threads. Codex tags the same
+/// `source.subagent.other: "guardian"` thread `thread_source: "guardian_review"`
+/// in newer builds (seen from 0.150) but `"subagent"` in older ones; both land
+/// here so the row does not split by Codex version.
+pub const CODEX_GUARDIAN_AGENT: &str = "Codex Guardian";
+/// Agents-tab bucket for `codex exec` headless runs.
+pub const CODEX_HEADLESS_AGENT: &str = "Codex Headless";
+
 /// Codex entry structure (from JSONL files)
 #[derive(Debug, Deserialize)]
 pub struct CodexEntry {
@@ -35,12 +53,33 @@ pub struct CodexEntry {
 pub struct CodexPayload {
     pub id: Option<String>,
     pub forked_from_id: Option<String>,
+    /// `session_meta` only: the client that created the thread. Codex
+    /// app-server stamps it from the `initialize` request's `clientInfo.name`,
+    /// so a thread OpenClaw drove carries `"openclaw"` here.
+    pub originator: Option<String>,
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub model: Option<String>,
     pub model_name: Option<String>,
     pub model_info: Option<CodexModelInfo>,
     pub info: Option<CodexInfo>,
+    /// Fast/Priority tier recorded directly on request-level rollout items.
+    pub service_tier: Option<String>,
+    /// `thread_settings_applied` snapshot. This is the only wire location Codex
+    /// actually stamps the Fast/Priority service tier today (7,298 occurrences
+    /// across ~5,900 local rollouts, all in this shape; upstream codex-rs emits
+    /// it from `EventMsg::ThreadSettingsApplied` /
+    /// `ThreadSettingsSnapshot.service_tier`). The snapshot is thread-scoped:
+    /// emitted once near the head of a rollout and re-emitted only when the
+    /// user changes settings mid-thread, so the tier applies to every turn
+    /// until the next snapshot — unlike the request-scoped arms below, it must
+    /// not be reset at `turn_context` boundaries.
+    pub thread_settings: Option<CodexThreadSettings>,
+    /// Request-level usage item; kept as a service-tier forward-compat arm in
+    /// case Codex ever stamps the tier on request-level usage records. Its
+    /// token counters are not emitted separately because the existing
+    /// token_count stream already accounts for them.
+    pub usage: Option<CodexTokenUsage>,
     pub turn_id: Option<String>,
     /// Unix timestamp (seconds) from `task_started` events. Legacy Codex turns
     /// may use UUID v4 ids, so this is their only causal ordering signal.
@@ -62,8 +101,6 @@ pub struct CodexPayload {
     pub cwd: Option<String>,
     /// Provider identity from session_meta (e.g. "openai", "azure")
     pub model_provider: Option<String>,
-    /// Agent name from session_meta
-    pub agent_nickname: Option<String>,
     /// Free-text body of an `event_msg` `user_message` payload. Used to detect
     /// human turn boundaries: real human input is plain text, whereas
     /// system-injected context (`<environment_context>`, `<system-reminder>`,
@@ -91,16 +128,27 @@ pub struct CodexModelInfo {
     pub slug: Option<String>,
 }
 
+/// `thread_settings` snapshot carried by `event_msg` `thread_settings_applied`
+/// payloads. Only the service tier is modeled; the remaining settings
+/// (approval policy, permission profile, cwd, reasoning effort, …) do not
+/// affect usage accounting.
+#[derive(Debug, Deserialize)]
+pub struct CodexThreadSettings {
+    pub service_tier: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CodexInfo {
     pub model: Option<String>,
     pub model_name: Option<String>,
+    pub service_tier: Option<String>,
     pub last_token_usage: Option<CodexTokenUsage>,
     pub total_token_usage: Option<CodexTokenUsage>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CodexTokenUsage {
+    pub service_tier: Option<String>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
@@ -211,6 +259,7 @@ impl CodexTotals {
             output: (self.output.max(0) - clamped_reasoning).max(0),
             cache_read: clamped_cached,
             cache_write: 0,
+            cache_write_1h: 0,
             reasoning: clamped_reasoning,
         }
     }
@@ -219,12 +268,34 @@ impl CodexTotals {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CodexParseState {
     pub current_model: Option<String>,
+    /// Tier from the latest thread-scoped `thread_settings_applied`
+    /// snapshot. It applies to every later turn until another snapshot
+    /// replaces or clears it, so turn boundaries never reset it.
+    #[serde(default)]
+    pub thread_service_tier: Option<String>,
+    /// Tier from a request-scoped record (`token_usage_record`,
+    /// `turn_context`, or a `token_count` info/usage field). It overrides the
+    /// thread tier for its own turn and is cleared at the next
+    /// `turn_context`, which restores the thread tier.
+    #[serde(default)]
+    pub request_service_tier: Option<String>,
     #[serde(default)]
     pub current_turn_start_ms: Option<i64>,
     #[serde(default)]
     pub last_accepted_token_timestamp_ms: Option<i64>,
     pub previous_totals: Option<CodexTotals>,
     pub session_is_headless: bool,
+    /// Set when session_meta marks a thread Codex started itself (any
+    /// `source.subagent` variant, or `thread_source: "subagent"`), as opposed
+    /// to a human-initiated fork (`thread_source: "user"`). Guardian reviews
+    /// set `session_is_guardian` instead.
+    #[serde(default)]
+    pub session_is_subagent: bool,
+    /// Set when session_meta marks a guardian review thread. Never cleared, so
+    /// a later session_meta in the same rollout cannot move its usage back
+    /// into the interactive bucket.
+    #[serde(default)]
+    pub session_is_guardian: bool,
     pub session_id_from_meta: Option<String>,
     pub session_forked_from_id: Option<String>,
     pub forked_child_session_id: Option<String>,
@@ -259,6 +330,99 @@ pub(crate) struct CodexParseState {
     /// it across incremental re-parses.
     #[serde(default)]
     pub forked_child_is_user_fork: bool,
+    /// Set when `session_meta.originator` names OpenClaw: this rollout records
+    /// turns OpenClaw drove through Codex app-server, so its usage belongs to
+    /// the `openclaw` client. Messages are emitted with `client = "openclaw"`
+    /// and the Codex thread id as their session id; the codex lane hands them
+    /// to the openclaw lane, which replaces OpenClaw's own last-response-only
+    /// mirror of those turns with them. `#[serde(default)]` keeps the decision
+    /// across incremental re-parses of appended chunks.
+    #[serde(default)]
+    pub session_owned_by_openclaw: bool,
+    /// `turn_id` of the turn being read, from its `task_started` /
+    /// `turn_context`. Attributes each token_count to the turn that produced
+    /// it, which is the granularity OpenClaw's transcript mirror uses when it
+    /// refers back to a Codex thread. `#[serde(default)]` keeps the current
+    /// turn across incremental re-parses.
+    #[serde(default)]
+    pub current_turn_id: Option<String>,
+    /// True while `current_turn_id` came from a `task_started` that neither
+    /// a `turn_context` nor any usage has followed yet. A `turn_context`
+    /// without an id then keeps the announced one; once the turn has a
+    /// `turn_context` or has produced usage, a `turn_context` without an id
+    /// starts a turn that has none. `#[serde(default)]` keeps it across
+    /// incremental re-parses.
+    #[serde(default)]
+    pub turn_id_announced_by_task_started: bool,
+    /// The turns this rollout has recorded usage for so far; see
+    /// [`CodexTurnCoverage`]. `#[serde(default)]` keeps it across incremental
+    /// re-parses, since a mirror row for an earlier turn still has to yield.
+    #[serde(default)]
+    pub turn_coverage: CodexTurnCoverage,
+}
+
+/// Which of a thread's turns a rollout recorded usage for.
+///
+/// OpenClaw mirrors each Codex app-server turn into its own transcript as one
+/// row with the last response's usage, keyed by `(thread id, turn id)`, and
+/// the lanes replace such a row with the rollout's complete record of that
+/// turn. The replacement has to be per turn, not per thread: a rollout that
+/// is truncated, or that had turns appended after it was read, covers only
+/// some of the turns its thread's mirror rows describe, and a mirror row for
+/// a turn the rollout does not hold is the only record of that turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodexTurnCoverage {
+    /// Turn ids a usage message was emitted under.
+    pub turn_ids: std::collections::HashSet<String>,
+    /// Usage was emitted with no turn id in effect. Rollouts written before
+    /// Codex stamped `turn_id` on `turn_context` look like this; such a
+    /// rollout can only be matched to its mirror rows thread-wide.
+    pub without_turn_id: bool,
+}
+
+impl CodexTurnCoverage {
+    fn record(&mut self, turn_id: Option<&str>) {
+        match turn_id {
+            Some(turn_id) => {
+                self.turn_ids.insert(turn_id.to_string());
+            }
+            None => self.without_turn_id = true,
+        }
+    }
+}
+
+/// Client id the `codex` parser tags rollouts OpenClaw drove with.
+pub(crate) const OPENCLAW_CLIENT_ID: &str = "openclaw";
+
+/// Codex thread id from a rollout filename, `rollout-<timestamp>-<uuid>.jsonl`.
+///
+/// Used where a rollout's ownership comes from its location rather than its
+/// `session_meta.originator`, so the parser did not already put the thread id
+/// on its messages. Returns `None` for any other spelling rather than guessing.
+pub(crate) fn thread_id_from_rollout_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let stem = stem.strip_prefix("rollout-")?;
+    // `2026-08-30T10-00-00-` is 20 chars; everything after is the thread id.
+    let candidate = stem.get(20..)?;
+    let is_uuid = candidate.len() == 36
+        && candidate
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            });
+    is_uuid.then(|| candidate.to_string())
+}
+
+/// True when a `session_meta.originator` identifies OpenClaw as the client
+/// that drove the thread. OpenClaw sends `clientInfo.name: "openclaw"` on the
+/// app-server handshake; the comparison ignores case so a capitalized
+/// product name (`"OpenClaw"`) matches too.
+fn codex_originator_is_openclaw(originator: Option<&str>) -> bool {
+    originator
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("openclaw"))
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +507,40 @@ fn parse_codex_reader<R: BufRead>(
         buffer.extend_from_slice(trimmed.as_bytes());
         if let Ok(entry) = simd_json::from_slice::<CodexEntry>(&mut buffer) {
             if let Some(payload) = entry.payload {
+                // Request-level usage records carry actual per-response tier
+                // metadata in newer Codex rollouts. The token_count snapshots
+                // remain the canonical usage source to avoid counting each
+                // response a second time.
+                if entry.entry_type == "token_usage_record" {
+                    if !state.forked_child_waiting_for_turn_context {
+                        if let Some(service_tier) = extract_request_service_tier(&payload) {
+                            state.request_service_tier = Some(service_tier);
+                        }
+                    }
+                    continue;
+                }
+
+                // The service tier's only real wire location today: a
+                // thread-scoped settings snapshot (upstream
+                // `EventMsg::ThreadSettingsApplied`). It applies to every turn
+                // until the next snapshot — including one whose tier is absent,
+                // which clears it — so it must never be reset at a
+                // `turn_context` boundary.
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("thread_settings_applied")
+                    && !state.forked_child_waiting_for_turn_context
+                {
+                    if payload.thread_settings.is_some() {
+                        // A snapshot without a tier (standard processing)
+                        // clears the sticky tier from then on.
+                        state.thread_service_tier = extract_thread_service_tier(&payload);
+                    } else if let Some(tier) = extract_request_service_tier(&payload) {
+                        // Forward-compat: a flat tier on the snapshot itself.
+                        // An unrecognized shape never clears the sticky tier.
+                        state.thread_service_tier = Some(tier);
+                    }
+                }
+
                 let payload_model = extract_model(&payload);
                 let is_token_count = entry.entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("token_count");
@@ -352,6 +550,27 @@ fn parse_codex_reader<R: BufRead>(
                     None
                 };
                 let event_model = payload_model.clone().or(info_model.clone());
+
+                // The turn the following token_count rows belong to. Both
+                // `task_started` and `turn_context` start a turn, so each
+                // replaces the current id — with `None` when it carries no
+                // `turn_id`, as older Codex wrote them, so that turn's usage
+                // is not attributed to the previous turn. The one exception:
+                // a `turn_context` without an id keeps the id its own
+                // `task_started` announced just before it.
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_started")
+                {
+                    state.current_turn_id = payload.turn_id.clone();
+                    state.turn_id_announced_by_task_started = state.current_turn_id.is_some();
+                } else if entry.entry_type == "turn_context" {
+                    if payload.turn_id.is_some() {
+                        state.current_turn_id = payload.turn_id.clone();
+                    } else if !state.turn_id_announced_by_task_started {
+                        state.current_turn_id = None;
+                    }
+                    state.turn_id_announced_by_task_started = false;
+                }
 
                 if state.forked_child_waiting_for_turn_context {
                     if entry.entry_type == "turn_context"
@@ -365,6 +584,10 @@ fn parse_codex_reader<R: BufRead>(
                             state.session_id_from_meta = Some(id.clone());
                         }
                         state.current_model = payload_model.clone();
+                        // No tier bookkeeping here: this `turn_context` falls
+                        // through to the reset below, which clears any
+                        // request-scoped tier left by the parent replay. The
+                        // thread tier is untouched (replay snapshots were skipped).
                         handled = true;
                     } else {
                         if entry.entry_type == "event_msg"
@@ -415,6 +638,16 @@ fn parse_codex_reader<R: BufRead>(
                     }
                 }
 
+                // A `turn_context` starts a new turn, which ends only the
+                // request-scoped tier. The thread tier lives in its own slot,
+                // so a request-scoped record can never end it early.
+                if entry.entry_type == "turn_context" {
+                    state.request_service_tier = None;
+                }
+                if let Some(service_tier) = extract_request_service_tier(&payload) {
+                    state.request_service_tier = Some(service_tier);
+                }
+
                 if !pending_model_messages.is_empty()
                     && event_model.is_none()
                     && !is_token_count
@@ -429,6 +662,14 @@ fn parse_codex_reader<R: BufRead>(
                 }
 
                 if entry.entry_type == "session_meta" {
+                    // Only the file's own metadata decides ownership. A forked
+                    // child replays its parent's `session_meta` too, and that
+                    // copy is skipped by the replay gate above, so a child the
+                    // user forked in Codex from an OpenClaw-driven thread stays
+                    // Codex usage.
+                    if codex_originator_is_openclaw(payload.originator.as_deref()) {
+                        state.session_owned_by_openclaw = true;
+                    }
                     if codex_source_is_exec(payload.source.as_ref()) {
                         state.session_is_headless = true;
                     }
@@ -460,9 +701,30 @@ fn parse_codex_reader<R: BufRead>(
                     if let Some(ref provider) = payload.model_provider {
                         state.session_provider = Some(provider.clone());
                     }
-                    if let Some(ref nickname) = payload.agent_nickname {
-                        state.session_agent = Some(nickname.clone());
+                    if codex_thread_is_guardian(
+                        payload.thread_source.as_deref(),
+                        payload.source.as_ref(),
+                    ) {
+                        state.session_is_guardian = true;
+                    } else if codex_thread_is_subagent(
+                        payload.thread_source.as_deref(),
+                        payload.source.as_ref(),
+                    ) {
+                        state.session_is_subagent = true;
                     }
+                    // Codex's per-thread `agent_nickname` is a random alias
+                    // (Popper, Dirac, …), not a role; bucket by thread kind
+                    // instead so the Agents tab stays aggregateable.
+                    state.session_agent = Some(
+                        if state.session_is_guardian {
+                            CODEX_GUARDIAN_AGENT
+                        } else if state.session_is_subagent {
+                            CODEX_SUBAGENT_AGENT
+                        } else {
+                            CODEX_DEFAULT_AGENT
+                        }
+                        .to_string(),
+                    );
                     if let Some(ref cwd) = payload.cwd {
                         let (workspace_key, workspace_label) = codex_workspace_from_cwd(cwd);
                         state.session_workspace_key = workspace_key;
@@ -484,6 +746,23 @@ fn parse_codex_reader<R: BufRead>(
                         );
                     }
                     handled = true;
+                }
+
+                // Some resumed turns emit `task_started` without a following
+                // `turn_context`. Reset the duration cursor at that boundary
+                // so the next token_count cannot include the preceding idle
+                // gap. When present, `started_at` is the turn's Unix-second
+                // timestamp; otherwise use the event timestamp. A later
+                // `turn_context` still replaces this anchor as usual.
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_started")
+                {
+                    let turn_start_ms = payload
+                        .started_at
+                        .map(|timestamp| timestamp.saturating_mul(1_000))
+                        .or_else(|| parse_codex_entry_timestamp(entry.timestamp.as_deref()));
+                    state.current_turn_start_ms = turn_start_ms;
+                    state.last_accepted_token_timestamp_ms = turn_start_ms;
                 }
 
                 // A human `user_message` event starts a new turn. The event
@@ -620,7 +899,7 @@ fn parse_codex_reader<R: BufRead>(
                     );
 
                     let agent = if state.session_is_headless {
-                        Some("headless".to_string())
+                        Some(CODEX_HEADLESS_AGENT.to_string())
                     } else {
                         state.session_agent.clone()
                     };
@@ -631,17 +910,38 @@ fn parse_codex_reader<R: BufRead>(
                         .or_else(|| model.as_deref().and_then(inferred_provider_from_model))
                         .unwrap_or("openai");
 
+                    // A rollout OpenClaw drove is OpenClaw's usage: tag it so
+                    // and key it by the Codex thread id, which is what
+                    // OpenClaw's transcript mirror names when it refers back
+                    // to this thread.
+                    let (client, message_session_id) = if state.session_owned_by_openclaw {
+                        (
+                            OPENCLAW_CLIENT_ID,
+                            state.session_id_from_meta.as_deref().unwrap_or(session_id),
+                        )
+                    } else {
+                        ("codex", session_id)
+                    };
                     let mut message = UnifiedMessage::new_with_agent(
-                        "codex",
+                        client,
                         model.clone().unwrap_or_else(|| "unknown".to_string()),
                         provider,
-                        session_id.to_string(),
+                        message_session_id.to_string(),
                         timestamp,
                         tokens,
                         0.0,
                         agent,
                     );
+                    message.service_tier = state
+                        .request_service_tier
+                        .clone()
+                        .or_else(|| state.thread_service_tier.clone());
                     message.duration_ms = duration_ms;
+                    state.turn_coverage.record(state.current_turn_id.as_deref());
+                    // The announced turn has produced usage, so it is under
+                    // way: a `turn_context` without an id that comes later
+                    // starts another turn, not this one.
+                    state.turn_id_announced_by_task_started = false;
                     // Apply a deferred human-turn marker from a preceding
                     // user_message to this assistant reply — the first
                     // token-bearing message after the human input.
@@ -776,6 +1076,22 @@ fn parse_codex_reader<R: BufRead>(
 
 fn codex_source_is_exec(source: Option<&Value>) -> bool {
     source.and_then(Value::as_str) == Some("exec")
+}
+
+fn codex_thread_is_guardian(thread_source: Option<&str>, source: Option<&Value>) -> bool {
+    thread_source == Some("guardian_review")
+        || source
+            .and_then(|source| source.get("subagent"))
+            .and_then(|subagent| subagent.get("other"))
+            .and_then(Value::as_str)
+            == Some("guardian")
+}
+
+/// Any `source.subagent` variant counts, not only the `thread_spawn` shape
+/// `forked_from_id_from_source` reads, so a subagent kind the parser does not
+/// model still stays out of the interactive bucket.
+fn codex_thread_is_subagent(thread_source: Option<&str>, source: Option<&Value>) -> bool {
+    thread_source == Some("subagent") || source.and_then(|source| source.get("subagent")).is_some()
 }
 
 fn forked_from_id_from_source(source: Option<&Value>) -> Option<&str> {
@@ -1116,6 +1432,55 @@ fn extract_model_from_info(info: &CodexInfo) -> Option<String> {
         .or(info.model_name.clone().filter(|s| !s.is_empty()))
 }
 
+fn normalize_service_tier(tier: Option<&str>) -> Option<String> {
+    tier.map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// The thread-scoped tier from a `thread_settings_applied` snapshot. An
+/// absent tier returns `None`, which clears the sticky thread tier.
+fn extract_thread_service_tier(payload: &CodexPayload) -> Option<String> {
+    normalize_service_tier(
+        payload
+            .thread_settings
+            .as_ref()
+            .and_then(|settings| settings.service_tier.as_deref()),
+    )
+}
+
+/// Request-scoped tier arms. None are emitted by current Codex builds; they
+/// are kept for forward compatibility and never read `thread_settings`.
+fn extract_request_service_tier(payload: &CodexPayload) -> Option<String> {
+    normalize_service_tier(
+        payload
+            .service_tier
+            .as_deref()
+            .or_else(|| {
+                payload.info.as_ref().and_then(|info| {
+                    info.service_tier
+                        .as_deref()
+                        .or_else(|| {
+                            info.last_token_usage
+                                .as_ref()
+                                .and_then(|usage| usage.service_tier.as_deref())
+                        })
+                        .or_else(|| {
+                            info.total_token_usage
+                                .as_ref()
+                                .and_then(|usage| usage.service_tier.as_deref())
+                        })
+                })
+            })
+            .or_else(|| {
+                payload
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.service_tier.as_deref())
+            }),
+    )
+}
+
 struct CodexHeadlessUsage {
     input: i64,
     output: i64,
@@ -1155,7 +1520,7 @@ fn parse_codex_headless_line(
         .or_else(|| inferred_provider_from_model(&model))
         .unwrap_or("openai");
     let agent = if session_is_headless {
-        Some("headless".to_string())
+        Some(CODEX_HEADLESS_AGENT.to_string())
     } else {
         session_agent.clone()
     };
@@ -1172,6 +1537,7 @@ fn parse_codex_headless_line(
                 output: usage.output.max(0),
                 cache_read: usage.cached.max(0),
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,
@@ -1281,6 +1647,8 @@ mod tests {
 
     const CODEX_DURATION_FIXTURE: &str =
         include_str!("../../tests/fixtures/codex_duration_timing.jsonl");
+    const CODEX_TASK_STARTED_DURATION_FIXTURE: &str =
+        include_str!("../../tests/fixtures/codex_task_started_duration.jsonl");
 
     #[test]
     fn codex_human_turn_matches_only_known_system_tags() {
@@ -1367,6 +1735,158 @@ mod tests {
         assert_eq!(messages[0].tokens.input, 100);
         assert_eq!(messages[0].tokens.output, 30);
         assert_eq!(messages[0].tokens.cache_read, 20);
+    }
+
+    #[test]
+    fn test_service_tier_is_carried_from_request_and_token_count_records() {
+        let file = create_test_file(concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":10,"output_tokens":3,"service_tier":"priority"}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"service_tier":"default","total_token_usage":{"input_tokens":20,"output_tokens":6,"total_tokens":26},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "request usage records must not double-count tokens"
+        );
+        assert_eq!(messages[0].service_tier.as_deref(), Some("priority"));
+        assert_eq!(messages[1].service_tier.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_turn_context_resets_service_tier_without_dropping_new_turn_metadata() {
+        let file = create_test_file(concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-terra","service_tier":"priority"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":6,"total_tokens":26},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].service_tier.as_deref(), Some("priority"));
+        assert_eq!(messages[1].service_tier, None);
+    }
+
+    #[test]
+    fn test_thread_settings_applied_service_tier_is_sticky_across_turns_and_clears_on_none_snapshot(
+    ) {
+        // Fixture built from a real `thread_settings_applied` rollout line
+        // (`~/.codex/sessions/2026/09/05`, thread settings payload reduced to
+        // the fields Codex actually emits there). This is the ONLY wire
+        // location that carries the tier today: ~7,300 `service_tier`
+        // occurrences across the local rollout corpus, all in this shape.
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-09-05T07:00:39.728Z","ordinal":10,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"01a0705e-8c8e-73d1-a6b5-c2d1c297342d","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"gateway","service_tier":"priority"}}}"#,
+            "
+",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "
+",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "
+",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "
+",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":6,"total_tokens":26},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "
+",
+            // A later snapshot without a tier (e.g. the user switched back to
+            // standard processing) clears the sticky tier from then on.
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","model_provider_id":"gateway"}}}"#,
+            "
+",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "
+",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":9,"total_tokens":39},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "
+"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 3);
+        // The 2x OpenAI Fast/Priority premium engages on the first turn...
+        assert_eq!(messages[0].service_tier.as_deref(), Some("priority"));
+        // ...and persists across the next `turn_context` boundary because the
+        // snapshot is thread-scoped, not request-scoped.
+        assert_eq!(messages[1].service_tier.as_deref(), Some("priority"));
+        // A later `thread_settings_applied` without a tier clears it.
+        assert_eq!(messages[2].service_tier, None);
+    }
+
+    #[test]
+    fn test_thread_snapshot_without_settings_object_keeps_or_sets_the_sticky_tier() {
+        // Only a snapshot that carries `thread_settings` may clear the sticky
+        // tier. A flat tier on the snapshot sets it (forward-compat), and an
+        // unrecognized shape leaves it alone instead of wiping the premium.
+        let file = create_test_file(concat!(
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","service_tier":"priority"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":6,"total_tokens":26},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].service_tier.as_deref(), Some("priority"));
+        assert_eq!(messages[1].service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn test_request_scoped_tier_overrides_one_turn_without_ending_the_thread_tier() {
+        // A request-scoped tier (forward-compat arm) applies to its own turn
+        // only. The next `turn_context` must restore the sticky thread tier
+        // rather than clearing every later turn back to standard pricing.
+        let file = create_test_file(concat!(
+            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","service_tier":"priority"}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":10,"output_tokens":3,"service_tier":"flex"}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":6,"total_tokens":26},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":9,"total_tokens":39},"last_token_usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].service_tier.as_deref(), Some("flex"));
+        assert_eq!(messages[1].service_tier.as_deref(), Some("priority"));
+        assert_eq!(messages[2].service_tier.as_deref(), Some("priority"));
     }
 
     #[test]
@@ -1722,7 +2242,317 @@ mod tests {
         let messages = parse_codex_file(file.path());
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].agent.as_deref(), Some("headless"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_HEADLESS_AGENT));
+    }
+
+    #[test]
+    fn test_session_meta_openclaw_originator_retags_the_rollout_as_openclaw() {
+        // OpenClaw drives Codex app-server with `clientInfo.name: "openclaw"`,
+        // which Codex records as the rollout's originator. The turns are
+        // OpenClaw's usage, so they leave the parser tagged `openclaw` and
+        // keyed by the Codex thread id instead of the file stem.
+        let line1 = r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","cli_version":"0.120.0","source":"cli","model_provider":"openai","cwd":"/Users/alice/.openclaw/workspace"}}"#;
+        let line2 = r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#;
+        let line3 = r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        let content = format!("{}\n{}\n{}\n", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(parsed.parse_succeeded);
+        assert!(parsed.state.session_owned_by_openclaw);
+        assert_eq!(parsed.consumed_offset, content.len() as u64);
+        assert_eq!(parsed.messages.len(), 1);
+        let message = &parsed.messages[0];
+        assert_eq!(message.client, "openclaw");
+        assert_eq!(message.session_id, "thread-1");
+        assert_eq!(message.model_id, "gpt-5.2-codex");
+        assert_eq!(message.provider_id, "openai");
+        assert_eq!(message.tokens.input, 80);
+        assert_eq!(message.tokens.cache_read, 20);
+        assert_eq!(message.tokens.output, 30);
+
+        // Case only differs by product spelling; still OpenClaw.
+        let capitalized =
+            content.replace(r#""originator":"openclaw""#, r#""originator":"OpenClaw""#);
+        let file = create_test_file(&capitalized);
+        let messages = parse_codex_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "openclaw");
+    }
+
+    #[test]
+    fn test_openclaw_ownership_survives_incremental_resume() {
+        let head = concat!(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+            "\n"
+        );
+        let file = create_test_file(head);
+        let first = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(first.messages.is_empty());
+        assert!(first.state.session_owned_by_openclaw);
+        assert_eq!(first.consumed_offset, head.len() as u64);
+
+        // A later turn appends token counts; the resumed parse never re-reads
+        // the session_meta line, so ownership has to come from the state.
+        let tail = concat!(
+            r#"{"timestamp":"2026-08-30T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+
+        let resumed = parse_codex_file_incremental(file.path(), first.consumed_offset, first.state);
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].client, "openclaw");
+        assert_eq!(resumed.messages[0].session_id, "thread-1");
+        assert_eq!(resumed.consumed_offset, (head.len() + tail.len()) as u64);
+    }
+
+    #[test]
+    fn test_other_originators_stay_codex() {
+        for originator in ["codex_cli_rs", "codex-tui", "Codex Desktop", "codex_exec"] {
+            let line1 = format!(
+                r#"{{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{{"id":"thread-1","originator":"{originator}","source":"cli","model_provider":"openai"}}}}"#
+            );
+            let line2 = r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+            let line3 = r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#;
+            let file = create_test_file(&format!("{}\n{}\n{}", line1, line2, line3));
+            let messages = parse_codex_file(file.path());
+            assert_eq!(
+                messages.len(),
+                1,
+                "originator {originator:?} must keep parsing"
+            );
+            assert_eq!(messages[0].client, "codex");
+            assert_ne!(messages[0].session_id, "thread-1");
+        }
+    }
+
+    #[test]
+    fn test_replayed_parent_originator_does_not_claim_a_forked_child() {
+        // A child the user forked in Codex from an OpenClaw-driven thread
+        // replays the parent's session_meta (originator openclaw) before its
+        // own turns. Ownership comes from the child's own metadata only.
+        let child_by_user = concat!(
+            r#"{"timestamp":"2026-08-30T10:01:00Z","type":"session_meta","payload":{"id":"child","forked_from_id":"parent","originator":"Codex Desktop","source":"vscode","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"parent","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:02Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"output_tokens":45},"last_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":15}}}}"#,
+            "\n"
+        );
+        let file = create_test_file(child_by_user);
+        let messages = parse_codex_file(file.path());
+        assert!(!messages.is_empty());
+        assert!(messages.iter().all(|m| m.client == "codex"), "{messages:?}");
+
+        // The mirror image: OpenClaw forked the thread itself.
+        let child_by_openclaw = child_by_user.replace(
+            r#""id":"child","forked_from_id":"parent","originator":"Codex Desktop""#,
+            r#""id":"child","forked_from_id":"parent","originator":"openclaw""#,
+        );
+        let file = create_test_file(&child_by_openclaw);
+        let messages = parse_codex_file(file.path());
+        assert!(!messages.is_empty());
+        assert!(
+            messages.iter().all(|m| m.client == "openclaw"),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| m.session_id == "child"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_turn_coverage_records_the_turns_usage_was_emitted_under() {
+        // OpenClaw's transcript mirrors a Codex turn by (thread, turn id), so
+        // a rollout has to say which turns it holds usage for. Either of
+        // `task_started` and `turn_context` announces a turn; the coverage
+        // survives an incremental resume; a rollout written before Codex
+        // stamped turn ids can only be matched thread-wide and says so.
+        let turn_a = concat!(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw","source":"cli","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-a","started_at":1756548001}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-5.2-codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n",
+        );
+        let later_turns = concat!(
+            // Announced by `turn_context` alone.
+            r#"{"timestamp":"2026-08-30T10:01:01Z","type":"turn_context","payload":{"turn_id":"turn-b","model":"gpt-5.2-codex"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:01:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"cached_input_tokens":40,"output_tokens":75},"last_token_usage":{"input_tokens":150,"cached_input_tokens":20,"output_tokens":45}}}}"#,
+            "\n",
+            // Announced by `task_started` alone.
+            r#"{"timestamp":"2026-08-30T10:02:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-c","started_at":1756548121}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-30T10:02:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":400,"cached_input_tokens":60,"output_tokens":100},"last_token_usage":{"input_tokens":150,"cached_input_tokens":20,"output_tokens":25}}}}"#,
+            "\n",
+        );
+        let expected_turns = |turns: &[&str]| CodexTurnCoverage {
+            turn_ids: turns.iter().map(|turn| turn.to_string()).collect(),
+            without_turn_id: false,
+        };
+
+        let file = create_test_file(&format!("{turn_a}{later_turns}"));
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-b", "turn-c"])
+        );
+
+        // Read in two chunks, the way the cache resumes an appended rollout.
+        let file = create_test_file(turn_a);
+        let first = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(first.state.turn_coverage, expected_turns(&["turn-a"]));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap()
+            .write_all(later_turns.as_bytes())
+            .unwrap();
+        let resumed = parse_codex_file_incremental(file.path(), first.consumed_offset, first.state);
+        assert_eq!(resumed.messages.len(), 2);
+        assert_eq!(
+            resumed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-b", "turn-c"])
+        );
+
+        // No turn ids anywhere: usage was emitted, but under no turn.
+        let unstamped = turn_a
+            .replace(r#""turn_id":"turn-a","#, "")
+            .replace(r#"{"turn_id":"turn-a","model""#, r#"{"model""#);
+        assert!(!unstamped.contains("turn_id"), "{unstamped}");
+        let file = create_test_file(&unstamped);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: Default::default(),
+                without_turn_id: true,
+            }
+        );
+
+        // A turn that arrives without an id after turns that had one (a
+        // resume under an older Codex) must not be attributed to the last
+        // identified turn: it is usage without a turn id.
+        let unstamped_later = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&unstamped_later);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: ["turn-a".to_string()].into_iter().collect(),
+                without_turn_id: true,
+            }
+        );
+
+        // A `turn_context` without an id right after its own `task_started`
+        // keeps the announced id.
+        let announced_only = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-d","started_at":1756548181}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&announced_only);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            expected_turns(&["turn-a", "turn-d"])
+        );
+
+        // Once the announced turn has produced usage, a later `turn_context`
+        // without an id is another turn, not a late confirmation of that
+        // one: its usage is recorded without a turn id.
+        let announced_then_unstamped = format!(
+            "{turn_a}{}",
+            concat!(
+                r#"{"timestamp":"2026-08-30T10:03:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-d","started_at":1756548181}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:03:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":70,"output_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:04:01Z","type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-30T10:04:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":700,"cached_input_tokens":90,"output_tokens":150},"last_token_usage":{"input_tokens":200,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+                "\n",
+            )
+        );
+        let file = create_test_file(&announced_then_unstamped);
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed.state.turn_coverage,
+            CodexTurnCoverage {
+                turn_ids: ["turn-a", "turn-d"]
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
+                without_turn_id: true,
+            }
+        );
+
+        // A rollout with no usage covers nothing.
+        let file = create_test_file(
+            r#"{"timestamp":"2026-08-30T10:00:00Z","type":"session_meta","payload":{"id":"thread-1","originator":"openclaw"}}
+{"timestamp":"2026-08-30T10:00:01Z","type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-5.2-codex"}}
+"#,
+        );
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(parsed.messages.is_empty());
+        assert_eq!(parsed.state.turn_coverage, CodexTurnCoverage::default());
+    }
+
+    #[test]
+    fn test_thread_id_from_rollout_path() {
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new(
+                "/x/codex-home/sessions/2026/08/30/rollout-2026-08-30T10-00-00-0192f3a4-5b6c-7d8e-9f01-23456789abcd.jsonl"
+            ))
+            .as_deref(),
+            Some("0192f3a4-5b6c-7d8e-9f01-23456789abcd")
+        );
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new("/x/session.jsonl")),
+            None
+        );
+        assert_eq!(
+            thread_id_from_rollout_path(Path::new(
+                "/x/rollout-2026-08-30T10-00-00-not-a-uuid.jsonl"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -2059,7 +2889,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
-        assert_eq!(messages[0].agent.as_deref(), Some("my-agent"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_DEFAULT_AGENT));
     }
 
     #[test]
@@ -2077,12 +2907,65 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "openai");
-        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
         assert_eq!(
             messages[0].workspace_key.as_deref(),
             Some("/Users/alice/codex-fork")
         );
         assert!(messages[0].dedup_key.is_some());
+    }
+
+    fn single_turn_agent(session_meta_lines: &str) -> Option<String> {
+        let file = create_test_file(&format!(
+            "{session_meta_lines}\n{}\n{}\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        messages[0].agent.clone()
+    }
+
+    #[test]
+    fn test_guardian_review_thread_gets_guardian_agent() {
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
+    }
+
+    #[test]
+    fn test_guardian_thread_tagged_subagent_gets_guardian_agent() {
+        // Older Codex builds tagged the same guardian thread
+        // `thread_source: "subagent"`; it must not land in the subagent row.
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","parent_thread_id":"parent-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent","model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
+    }
+
+    #[test]
+    fn test_non_spawn_subagent_source_gets_subagent_agent() {
+        let agent = single_turn_agent(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"review-thread","source":{"subagent":"review"},"model_provider":"openai","cwd":"/repo"}}"#,
+        );
+
+        assert_eq!(agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
+    }
+
+    #[test]
+    fn test_later_session_meta_keeps_guardian_agent() {
+        let agent = single_turn_agent(concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"guardian-thread","source":{"subagent":{"other":"guardian"}},"thread_source":"guardian_review","model_provider":"openai","cwd":"/repo"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:00.500Z","type":"session_meta","payload":{"id":"parent-thread","source":"vscode","thread_source":"user","model_provider":"openai","cwd":"/repo"}}"#,
+        ));
+
+        assert_eq!(agent.as_deref(), Some(CODEX_GUARDIAN_AGENT));
     }
 
     #[test]
@@ -2109,7 +2992,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "gpt-5.5");
         assert_eq!(messages[0].provider_id, "openai");
-        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_SUBAGENT_AGENT));
         assert_eq!(messages[0].workspace_key.as_deref(), Some("/repo-child"));
         assert_eq!(messages[0].tokens.input, 500);
         assert_eq!(messages[0].tokens.cache_read, 1000);
@@ -2676,6 +3559,7 @@ mod tests {
     #[test]
     fn test_cached_tokens_takes_max_of_both_fields() {
         let usage = CodexTokenUsage {
+            service_tier: None,
             input_tokens: Some(100),
             output_tokens: Some(30),
             cached_input_tokens: Some(10),
@@ -2706,7 +3590,7 @@ mod tests {
 
     #[test]
     fn test_headless_fallback_uses_session_provider_and_agent() {
-        // session_meta sets provider to "azure" and agent to "my-bot",
+        // session_meta sets provider to "azure" and the default agent bucket,
         // then a line falls through to headless parsing (no structured entry_type)
         let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"model_provider":"azure","agent_nickname":"my-bot"}}"#;
         let line2 = r#"{"type":"turn.completed","model":"gpt-4o","usage":{"input_tokens":100,"output_tokens":50}}"#;
@@ -2717,7 +3601,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
-        assert_eq!(messages[0].agent.as_deref(), Some("my-bot"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_DEFAULT_AGENT));
     }
 
     #[test]
@@ -2858,7 +3742,7 @@ mod tests {
             messages[0].is_turn_start,
             "an exec one-shot with a human prompt counts as one turn"
         );
-        assert_eq!(messages[0].agent.as_deref(), Some("headless"));
+        assert_eq!(messages[0].agent.as_deref(), Some(CODEX_HEADLESS_AGENT));
     }
 
     #[test]
@@ -2962,6 +3846,27 @@ mod tests {
         assert!(
             messages[1].is_turn_start,
             "the deferred turn-start marker must still apply"
+        );
+    }
+
+    #[test]
+    fn test_task_started_duration_boundaries_from_fixture() {
+        let file = create_test_file(CODEX_TASK_STARTED_DURATION_FIXTURE);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.duration_ms)
+                .collect::<Vec<_>>(),
+            vec![Some(1_000), Some(1_000), Some(750), Some(500)]
+        );
+        assert_eq!(messages[1].timestamp, 2_209_075_200_000);
+        assert_eq!(
+            messages[2].timestamp,
+            parse_codex_entry_timestamp(Some("2040-01-03T00:00:00.250Z")).unwrap()
         );
     }
 }

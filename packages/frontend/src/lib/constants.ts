@@ -52,6 +52,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   goose: "Goose",
   antigravity: "Antigravity",
   "antigravity-cli": "Antigravity CLI",
+  "antigravity-extension": "Antigravity IDE Extension",
   zed: "Zed Agent",
   trae: "Trae",
   warp: "Warp",
@@ -82,6 +83,8 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   lmstudio: "LM Studio",
   unsloth: "Unsloth",
   hindsight: "Hindsight",
+  "micode-desktop": "Xiaomi MiMo AI",
+  muse: "Muse Code",
 };
 
 // Client logos from GitHub CDN (public repo)
@@ -112,6 +115,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   goose: `${GITHUB_CDN_BASE}/client-goose.png`,
   antigravity: `${GITHUB_CDN_BASE}/client-antigravity.png`,
   "antigravity-cli": `${GITHUB_CDN_BASE}/client-antigravity.png`,
+  "antigravity-extension": `${GITHUB_CDN_BASE}/client-antigravity.png`,
   zed: `${GITHUB_CDN_BASE}/client-zed.webp`,
   trae: `${GITHUB_CDN_BASE}/client-trae.png`,
   warp: "https://github.com/warpdotdev.png",
@@ -147,6 +151,9 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   lmstudio: "https://github.com/lmstudio-ai.png",
   unsloth: "https://github.com/unslothai.png",
   hindsight: `${GITHUB_CDN_BASE}/client-hindsight.png`,
+  // Distinct desktop product icon (from Xiaomi MiMo AI.app Resources/icon.icns).
+  "micode-desktop": `${GITHUB_CDN_BASE}/client-micode-desktop.png`,
+  muse: "https://github.com/meta-models.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
@@ -175,6 +182,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   goose: "#64B4DC",
   antigravity: "#6366F1",
   "antigravity-cli": "#6366F1",
+  "antigravity-extension": "#6366F1",
   zed: "#084CCF",
   trae: "#00BFA5",
   warp: "#01A4A4",
@@ -205,6 +213,8 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   lmstudio: "#6C5CE7",
   unsloth: "#58CC02",
   hindsight: "#0891B2",
+  "micode-desktop": "#FF6900",
+  muse: "#0064E0",
 };
 
 // Derived values

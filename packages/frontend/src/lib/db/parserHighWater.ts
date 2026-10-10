@@ -6,9 +6,9 @@ import {
 import { createSafeRecord, ownValue } from "../safeRecord";
 
 /**
- * Clients whose submissions are bounded by a device/client lifetime
- * high-water instead of being merged day by day, mapped to the parser
- * generation the server accepts.
+ * Parser generations accepted for re-attributing clients. Most use a
+ * device/client lifetime high-water; source families that can overlap use an
+ * atomic family transition instead of independent client ledgers.
  *
  * A client belongs here when its parser can re-attribute usage it has already
  * submitted. The per-day merge guard refuses a decrease per (day, client), so
@@ -22,22 +22,19 @@ import { createSafeRecord, ownValue } from "../safeRecord";
  * covers the credited lifetime therefore replaces stored days so the web
  * graph matches the TUI, without the per-day merge guard inflating totals.
  *
- * Both Antigravity clients are registered at generation 1, the generation every
- * CLI already declares. Their parsers stopped dating usage at the session's
- * start: `antigravity-cli` reads a per-generation stamp out of `gen_metadata`,
- * and `antigravity` correlates standalone rows to trajectory steps. A rescan
- * therefore moves unchanged usage off the session-start day and onto the days
- * the work actually happened, which is precisely the shape the per-day guard
- * turns into permanent inflation. Antigravity CLI is registered at
- * generation 1 for the same reason: its turns used to be dated at the session
- * start and are now dated by the timestamp of the generation that produced
- * them, so a rescan spreads an unchanged session across the days it actually
- * ran without changing what it spent.
+ * Antigravity parsers are registered at generation 1. The database parser is
+ * shared by the CLI and IDE extension, and reads a per-generation stamp out of
+ * `gen_metadata`; the `antigravity` parser correlates standalone rows to
+ * trajectory steps. All three source labels are admitted and reconciled as one
+ * family because the same provider response can appear in multiple surfaces.
  */
 export const SUPPORTED_VERSIONED_PARSERS: Readonly<Record<string, number>> = {
   copilot: 2,
   droid: 1,
+  // Membership and accepted generations for the atomic Antigravity family
+  // transition; the submit route deliberately skips independent client plans.
   "antigravity-cli": 1,
+  "antigravity-extension": 1,
   antigravity: 1,
 };
 
@@ -127,6 +124,12 @@ export interface ParserHighWaterPlan {
   /** Absolute cells when `mode` is `replace`; omitted otherwise. */
   layoutDays?: Record<string, ClientBreakdownData>;
   nextState?: ParserClientHighWaterState;
+  /**
+   * Tokens the credited lifetime baseline holds beyond this snapshot. Positive
+   * means no token growth is allocatable; messages have an independent budget
+   * and can still advance.
+   */
+  highWaterDeficit?: number;
 }
 
 function copyModels(
@@ -153,7 +156,7 @@ function copyModels(
   return result;
 }
 
-function modelsForHighWater(
+export function modelsForHighWater(
   breakdown?: ClientBreakdownData
 ): Record<string, ModelBreakdownData> {
   const models = copyModels(breakdown?.models);
@@ -314,7 +317,7 @@ function aggregateSnapshot(
   return aggregate;
 }
 
-const PARSER_HIGH_WATER_STATE_VERSION = 2;
+export const PARSER_HIGH_WATER_STATE_VERSION = 2;
 
 function normalizeStateDays(
   source: Record<string, ClientBreakdownData>
@@ -450,16 +453,25 @@ function allocateIncrements(
   previousAggregate: ParserAggregateHighWater,
   incomingAggregate: ParserAggregateHighWater
 ): Record<string, ClientBreakdownData> {
+  // Keep the complete credited lifetime in the budget. A client-reported
+  // retention boundary cannot prove that a missing old cell was pruned rather
+  // than re-dated into this snapshot, so excluding it could credit it twice.
   let tokenBudget = positive(incomingAggregate.tokens - previousAggregate.tokens);
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
+  // Per-cell capacity below still reads the FULL credited ledger, so a
+  // re-reported day cannot be credited twice.
   const previousObservedAggregate = aggregateSnapshot(previousObservedDays);
   const inclusiveInputBudget = positive(
     incomingAggregate.inputIncludingCacheRead -
       previousObservedAggregate.inputIncludingCacheRead
   );
-  const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
+  // Residual allocation is intentionally newest-first. ISO day keys sort by
+  // code point, avoiding a host's default locale changing which cell wins.
+  const dates = Object.keys(incomingDays).sort((a, b) =>
+    a === b ? 0 : a < b ? 1 : -1
+  );
   const cells = dates.flatMap((date) => {
     const incoming = incomingDays[date];
     const creditedModels = modelsForHighWater(
@@ -688,6 +700,12 @@ export function planParserHighWaterSubmission(args: {
   client: string;
   incomingVersion?: number;
   fullHistory: boolean;
+  /**
+   * Client-reported earliest `YYYY-MM-DD` still retained locally. It is
+   * preserved for the submission protocol but cannot relax the high-water
+   * without server-verifiable evidence of that retention transition.
+   */
+  retentionFloor?: string;
   existingLegacyDays: Record<string, ClientBreakdownData>;
   incomingDays: Record<string, ClientBreakdownData>;
   state?: ParserClientHighWaterState;
@@ -813,9 +831,13 @@ export function planParserHighWaterSubmission(args: {
     incomingAggregate
   );
 
+  const highWaterDeficit = positive(
+    previousAggregate.tokens - incomingAggregate.tokens
+  );
   return {
     mode: "incremental",
     increments,
+    ...(highWaterDeficit > 0 ? { highWaterDeficit } : {}),
     nextState: stateAfterCreditedIncrements(
       supportedVersion,
       previousCreditedDays,

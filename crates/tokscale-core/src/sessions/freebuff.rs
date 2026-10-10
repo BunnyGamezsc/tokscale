@@ -1,6 +1,6 @@
 //! Freebuff session parser
 //!
-//! Freebuff (https://github.com/CodebuffAI/freebuff) is not a separate program
+//! Freebuff (<https://github.com/CodebuffAI/freebuff>) is not a separate program
 //! from Codebuff: it is the same CLI compiled with `FREEBUFF_MODE=true`, a
 //! free-only build that strips paid features. It therefore resolves the same
 //! config dir (`~/.config/manicode[-dev|-staging]`) and writes the same
@@ -205,6 +205,7 @@ pub fn parse_freebuff_file(path: &Path) -> Vec<UnifiedMessage> {
                 output,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_1h: 0,
                 reasoning: 0,
             },
             0.0,

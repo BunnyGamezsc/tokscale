@@ -5,12 +5,17 @@ mod daily;
 pub mod dialog;
 mod footer;
 mod header;
+/// Test-only header-budget assertions, shared by every table module.
+#[cfg(test)]
+pub(crate) mod header_budget;
 mod hourly;
 mod hourly_profile;
 mod minutely;
+mod model_trend;
 mod models;
 mod monthly;
 mod overview;
+mod projects;
 mod sessions;
 pub mod spinner;
 mod stats;
@@ -21,6 +26,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::app::{App, Tab};
+use crate::tui::ui::widgets::AMBIENT_STABLE_BORDER_SET;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -56,6 +62,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Minutely => minutely::render(frame, app, chunks[1]),
             Tab::Monthly => monthly::render(frame, app, chunks[1]),
             Tab::Sessions => sessions::render(frame, app, chunks[1]),
+            Tab::Projects => projects::render(frame, app, chunks[1]),
             Tab::Stats => stats::render(frame, app, chunks[1]),
             Tab::Usage => usage::render(frame, app, chunks[1]),
         }
@@ -71,6 +78,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_loading(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -86,10 +94,11 @@ fn render_loading(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner)[1];
 
+    let lang = app.settings.tui_language;
     let mut spans = spinner::get_scanner_spans(app.spinner_frame, &app.theme);
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
-        spinner::get_phase_message("parsing-sources"),
+        spinner::get_phase_message("parsing-sources", lang),
         Style::default().fg(app.theme.muted),
     ));
 
@@ -102,6 +111,7 @@ fn render_loading(frame: &mut Frame, app: &App, area: Rect) {
 fn render_error(frame: &mut Frame, app: &App, area: Rect, error: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .style(Style::default().bg(app.theme.background));
 
@@ -117,7 +127,12 @@ fn render_error(frame: &mut Frame, app: &App, area: Rect, error: &str) {
         ])
         .split(inner)[1];
 
-    let text = format!("Error: {}", error);
+    let lang = app.settings.tui_language;
+    let text = format!(
+        "{}: {}",
+        crate::tui::i18n::tr(lang, crate::tui::i18n::MessageKey::LabelError),
+        error
+    );
     let paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Red))
         .alignment(Alignment::Center);

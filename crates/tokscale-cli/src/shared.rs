@@ -2,10 +2,9 @@
 //!
 //! FORK NOTE: these were defined inline in `main.rs` upstream. They live here so
 //! sibling modules can keep reaching them as `crate::ClientFilter` /
-//! `crate::saturating_token_total` from both the binary and the library target.
+//! the shared filter and date helpers from both the binary and the library target.
 
 use clap::{Args, ValueEnum};
-use tokscale_core::ClientId;
 
 /// Client identifiers exposed via `--client`.
 ///
@@ -84,6 +83,11 @@ pub enum ClientFilter {
     LmStudio,
     Unsloth,
     Hindsight,
+    #[value(name = "micode-desktop")]
+    MicodeDesktop,
+    Muse,
+    #[value(name = "antigravity-extension")]
+    AntigravityExtension,
     Synthetic,
 }
 
@@ -126,6 +130,7 @@ impl ClientFilter {
             Self::Commandcode => "commandcode",
             Self::Micode => "micode",
             Self::AntigravityCli => "antigravity-cli",
+            Self::AntigravityExtension => "antigravity-extension",
             Self::Junie => "junie",
             Self::Zcode => "zcode",
             Self::Opencodereview => "opencodereview",
@@ -147,6 +152,8 @@ impl ClientFilter {
             Self::LmStudio => "lmstudio",
             Self::Unsloth => "unsloth",
             Self::Hindsight => "hindsight",
+            Self::MicodeDesktop => "micode-desktop",
+            Self::Muse => "muse",
             Self::Synthetic => "synthetic",
         }
     }
@@ -157,7 +164,8 @@ impl ClientFilter {
     /// Used at boundaries where TUI state (`HashSet<ClientFilter>`) needs
     /// to feed core APIs that still consume `Vec<ClientId>`.
     pub fn to_client_id(self) -> Option<tokscale_core::ClientId> {
-                match self {
+        use tokscale_core::ClientId;
+        match self {
             Self::Opencode => Some(ClientId::OpenCode),
             Self::Claude => Some(ClientId::Claude),
             Self::Codex => Some(ClientId::Codex),
@@ -191,6 +199,7 @@ impl ClientFilter {
             Self::Commandcode => Some(ClientId::CommandCode),
             Self::Micode => Some(ClientId::MiMoCode),
             Self::AntigravityCli => Some(ClientId::AntigravityCli),
+            Self::AntigravityExtension => Some(ClientId::AntigravityExtension),
             Self::Junie => Some(ClientId::Junie),
             Self::Zcode => Some(ClientId::Zcode),
             Self::Opencodereview => Some(ClientId::OpenCodeReview),
@@ -212,6 +221,8 @@ impl ClientFilter {
             Self::LmStudio => Some(ClientId::LmStudio),
             Self::Unsloth => Some(ClientId::Unsloth),
             Self::Hindsight => Some(ClientId::Hindsight),
+            Self::MicodeDesktop => Some(ClientId::MiMoDesktop),
+            Self::Muse => Some(ClientId::Muse),
             Self::Synthetic => None,
         }
     }
@@ -219,7 +230,8 @@ impl ClientFilter {
     /// Lift a `ClientId` back into a `ClientFilter`. Total inverse of
     /// `to_client_id` for non-`Synthetic` variants.
     pub fn from_client_id(client: tokscale_core::ClientId) -> Self {
-                match client {
+        use tokscale_core::ClientId;
+        match client {
             ClientId::OpenCode => Self::Opencode,
             ClientId::Claude => Self::Claude,
             ClientId::Codex => Self::Codex,
@@ -252,6 +264,7 @@ impl ClientFilter {
             ClientId::CommandCode => Self::Commandcode,
             ClientId::MiMoCode => Self::Micode,
             ClientId::AntigravityCli => Self::AntigravityCli,
+            ClientId::AntigravityExtension => Self::AntigravityExtension,
             ClientId::Junie => Self::Junie,
             ClientId::Zcode => Self::Zcode,
             ClientId::OpenCodeReview => Self::Opencodereview,
@@ -273,6 +286,8 @@ impl ClientFilter {
             ClientId::LmStudio => Self::LmStudio,
             ClientId::Unsloth => Self::Unsloth,
             ClientId::Hindsight => Self::Hindsight,
+            ClientId::MiMoDesktop => Self::MicodeDesktop,
+            ClientId::Muse => Self::Muse,
         }
     }
 

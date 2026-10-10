@@ -749,6 +749,33 @@ fn create_empty_fixture_dir() -> TempDir {
     tmp
 }
 
+fn write_openclaw_checkpoint_fixture(base: &Path) -> std::path::PathBuf {
+    let sessions = base.join(".openclaw/agents/main/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let primary = sessions.join("session-original.jsonl");
+    let original = br#"{"type":"message","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","usage":{"input":100,"output":50},"timestamp":1788566869012}}"#;
+    fs::write(&primary, original).unwrap();
+
+    let checkpoint = "11111111-1111-4111-8111-111111111111";
+    let snapshot = br#"{"type":"message","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","usage":{"input":900,"output":450},"timestamp":1788566869012}}"#;
+    fs::write(
+        sessions.join(format!("session-original.checkpoint.{checkpoint}.jsonl")),
+        snapshot,
+    )
+    .unwrap();
+    for reason in ["deleted", "reset"] {
+        fs::write(
+            sessions.join(format!(
+                "session-original.checkpoint.{checkpoint}.jsonl.{reason}.2026-09-05T00-00-00.000Z.zst"
+            )),
+            zstd::encode_all(&snapshot[..], 0).unwrap(),
+        )
+        .unwrap();
+    }
+
+    primary
+}
+
 #[cfg(unix)]
 fn create_timezone_boundary_fixture_dir() -> TempDir {
     let tmp = TempDir::new().expect("failed to create temp dir");
@@ -1755,6 +1782,368 @@ fn test_import_stdout_is_pure_json() {
 }
 
 #[test]
+fn test_import_submit_dry_run_survives_cold_pricing_cache_with_local_sessions() {
+    // Regression for the #1363 follow-up: `import --submit` runs a local scan
+    // to dedupe against this machine's own usage. That scan only needs (date,
+    // client) identities, not submission-grade costs, so it must use the
+    // lenient local report. Previously it called the submission-grade
+    // generator, which hard-errors with "pricing data is unavailable for
+    // submission" when the pricing cache is cold (offline) and local sessions
+    // carry no provider-reported costs — aborting the entire import.
+    let home = TempDir::new().unwrap();
+    // Unpriced local session on the same (date, client) as the export: with
+    // the old submission-grade scan this combination was the failure trigger.
+    // `write_codex_token_session` hardcodes a 2026-01-01 timestamp, so write
+    // the 2026-05-11 session inline to land on the export's day.
+    let sessions = home.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("session-import-dedup.jsonl"),
+        concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-4o-mini"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    // No pricing cache anywhere under this home (TOKSCALE_PRICING_CACHE_ONLY=1
+    // plus the dead loopback proxies in cmd_with_home keep it that way).
+    // A second, non-overlapping codex day keeps the graph non-empty after
+    // dedup: the only overlap case the old code ever reached was a fully
+    // dropped graph (the empty day fell through), so a partial-overlap
+    // fixture is what actually proves the early-exit and the scan coexist.
+    let export_path = home.path().join("export.json");
+    fs::write(
+        &export_path,
+        r#"{
+          "dailyAggregates": [
+            {
+              "date": "2026-05-11",
+              "source": "codex",
+              "machineId": "m1",
+              "inputTokens": 100,
+              "outputTokens": 50,
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 10,
+              "totalCost": "0.50",
+              "modelsUsed": ["gpt-5.5"],
+              "modelBreakdowns": [
+                { "modelName": "gpt-5.5", "cost": 0.5, "inputTokens": 100,
+                  "outputTokens": 50, "cacheReadTokens": 10, "cacheCreationTokens": 0 }
+              ]
+            },
+            {
+              "date": "2026-05-12",
+              "source": "codex",
+              "machineId": "m1",
+              "inputTokens": 40,
+              "outputTokens": 20,
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "totalCost": "0.20",
+              "modelsUsed": ["gpt-5.5"],
+              "modelBreakdowns": [
+                { "modelName": "gpt-5.5", "cost": 0.2, "inputTokens": 40,
+                  "outputTokens": 20, "cacheReadTokens": 0, "cacheCreationTokens": 0 }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let output = cmd_with_home(home.path())
+        .args([
+            "import",
+            export_path.to_str().unwrap(),
+            "--submit",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("pricing data is unavailable"),
+        "cold pricing cache must not abort import --submit: {stderr}"
+    );
+    // The local session overlaps the export's first day, so it is dropped;
+    // the second day survives to the dry-run summary with a recomputed total.
+    assert!(
+        stderr.contains("Left out 1 day/client row(s)"),
+        "expected the overlap dedup to drop 2026-05-11 codex: {stderr}"
+    );
+    assert!(
+        stderr.contains("To submit as imported history (clawdboard): 1 days, 60 tokens, $0.20"),
+        "expected only the non-overlapping day to remain: {stderr}"
+    );
+    assert!(stderr.contains("Dry run - not submitting"));
+}
+
+#[test]
+fn test_import_submit_stops_when_the_local_scan_covers_every_row() {
+    // Every imported (date, client) row is already on this machine, so the
+    // overlap pass removes all of them. That must end with "Nothing left to
+    // submit." and no payload, not an empty backfill POST.
+    let home = TempDir::new().unwrap();
+    let sessions = home.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("session-import-full-overlap.jsonl"),
+        concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-4o-mini"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-11T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let export_path = home.path().join("export.json");
+    fs::write(
+        &export_path,
+        r#"{
+          "dailyAggregates": [
+            {
+              "date": "2026-05-11",
+              "source": "codex",
+              "machineId": "m1",
+              "inputTokens": 100,
+              "outputTokens": 50,
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "totalCost": "0.50",
+              "modelsUsed": ["gpt-5.5"],
+              "modelBreakdowns": [
+                { "modelName": "gpt-5.5", "cost": 0.5, "inputTokens": 100,
+                  "outputTokens": 50, "cacheReadTokens": 0, "cacheCreationTokens": 0 }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+    let payload_path = home.path().join("payload.json");
+
+    let output = cmd_with_home(home.path())
+        .args([
+            "import",
+            export_path.to_str().unwrap(),
+            "--submit",
+            "--dry-run",
+            "--output",
+            payload_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Left out 1 day/client row(s)"), "{stderr}");
+    assert!(stderr.contains("Nothing left to submit."), "{stderr}");
+    assert!(
+        !stderr.contains("To submit as imported history"),
+        "{stderr}"
+    );
+    assert!(
+        !payload_path.exists(),
+        "no payload may be written for an empty backfill"
+    );
+}
+
+/// Write a local recovery ledger (`recovered-usage-v1.json`) into the sandbox
+/// config dir `cmd_with_home` points the child at, restoring one request row
+/// for a session that is no longer on disk.
+///
+/// `home` must be the same string the child gets as `HOME`: `recovery::apply`
+/// ignores a ledger whose `home` names a different directory.
+fn write_recovery_ledger(home: &Path, client: &str, date: &str, timestamp_ms: i64, input: i64) {
+    let dir = sandbox_config_dir(home);
+    fs::create_dir_all(&dir).unwrap();
+    let ledger = serde_json::json!({
+        "version": 1,
+        "home": home.to_str().unwrap(),
+        "messages": [{
+            "client": client,
+            "model_id": "gpt-5.5",
+            "provider_id": "openai",
+            "session_id": "wiped-session",
+            "workspace_key": null,
+            "workspace_label": null,
+            "timestamp": timestamp_ms,
+            "date": date,
+            "tokens": {
+                "input": input,
+                "output": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "reasoning": 0
+            },
+            "cost": 0.0,
+            "agent": null,
+            "dedup_key": "wiped-session-row"
+        }]
+    });
+    fs::write(
+        dir.join("recovered-usage-v1.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One clawdboard day for `codex` on 2026-05-01: 100 input + 50 output tokens
+/// and $1.00, the row both recovery-overlay tests import.
+fn write_single_day_codex_export(home: &Path) -> std::path::PathBuf {
+    let export_path = home.join("export.json");
+    fs::write(
+        &export_path,
+        r#"{
+          "dailyAggregates": [
+            {
+              "date": "2026-05-01",
+              "source": "codex",
+              "machineId": "m1",
+              "inputTokens": 100,
+              "outputTokens": 50,
+              "cacheCreationTokens": 0,
+              "cacheReadTokens": 0,
+              "totalCost": "1.00",
+              "modelsUsed": ["gpt-5.5"],
+              "modelBreakdowns": [
+                { "modelName": "gpt-5.5", "cost": 1.0, "inputTokens": 100,
+                  "outputTokens": 50, "cacheReadTokens": 0, "cacheCreationTokens": 0 }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+    export_path
+}
+
+/// Midday UTC, so the day a fixture lands on is the same in every host zone
+/// the bucketer might auto-pin to.
+const RECOVERY_OVERLAY_DAY_MS: i64 = 1_777_636_800_000; // 2026-05-01T12:00:00Z
+
+#[test]
+fn test_import_submit_keeps_a_day_only_the_recovery_overlay_covers() {
+    // The overlap pass drops an imported (date, client) row that this machine's
+    // own scan already reports, because `tokscale submit` sends that day. The
+    // local recovery ledger is the one thing a local report shows that
+    // submission never sends: it is explicitly local-only. Scanning through the
+    // lenient *local* report therefore counted a recovery-only day as already
+    // covered, dropped the imported row for it, and left the usage on no path
+    // to the leaderboard at all — the exact case the ledger exists for (wiped
+    // transcripts). The scan must read source messages only.
+    let home = TempDir::new().unwrap();
+    // No sessions anywhere under this home: the ledger is the sole reason a
+    // local report would show 2026-05-01 codex usage.
+    write_recovery_ledger(
+        home.path(),
+        "codex",
+        "2026-05-01",
+        RECOVERY_OVERLAY_DAY_MS,
+        150,
+    );
+    let export_path = write_single_day_codex_export(home.path());
+
+    let output = cmd_with_home(home.path())
+        .args([
+            "import",
+            export_path.to_str().unwrap(),
+            "--submit",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Left out"),
+        "a day only the local-only recovery overlay covers is not covered by \
+         `tokscale submit`, so the imported row must not be dropped: {stderr}"
+    );
+    assert!(
+        stderr.contains("To submit as imported history (clawdboard): 1 days, 150 tokens, $1.00"),
+        "the recovery-only day must reach the submission summary: {stderr}"
+    );
+    assert!(!stderr.contains("Nothing left to submit."), "{stderr}");
+}
+
+#[test]
+fn test_import_submit_still_drops_a_day_a_real_transcript_covers() {
+    // Control for the test above: narrowing the overlap scan to source messages
+    // must not weaken double-count protection. Same ledger, same export, but a
+    // real codex transcript for that (date, client) is on disk — `tokscale
+    // submit` does report it, so the imported row still has to go.
+    let home = TempDir::new().unwrap();
+    write_recovery_ledger(
+        home.path(),
+        "codex",
+        "2026-05-01",
+        RECOVERY_OVERLAY_DAY_MS,
+        150,
+    );
+    let sessions = home.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("session-recovery-control.jsonl"),
+        concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-4o-mini"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-01T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let export_path = write_single_day_codex_export(home.path());
+    let payload_path = home.path().join("payload.json");
+
+    let output = cmd_with_home(home.path())
+        .args([
+            "import",
+            export_path.to_str().unwrap(),
+            "--submit",
+            "--dry-run",
+            "--output",
+            payload_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Left out 1 day/client row(s)") && stderr.contains("2026-05-01 codex"),
+        "a real transcript for the same day/client must still drop the imported \
+         row: {stderr}"
+    );
+    assert!(stderr.contains("Nothing left to submit."), "{stderr}");
+    assert!(
+        !payload_path.exists(),
+        "no payload may be written for an empty backfill"
+    );
+}
+
+#[test]
 fn test_import_does_not_leak_local_mcp_servers() {
     // Reusing the graph/submit converter must not embed the local
     // machine's configured MCP server names into data derived purely from
@@ -2398,6 +2787,57 @@ fn test_mcode_headless_stream_counts_identically_cold_and_warm_cache() {
         assert_eq!(entry["cacheWrite"].as_i64(), Some(50), "{pass} cache pass");
         assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
     }
+}
+
+#[test]
+fn test_openclaw_checkpoint_snapshots_do_not_inflate_cli_aggregates_or_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    let primary = write_openclaw_checkpoint_fixture(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "openclaw", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(100), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(50), "{pass} cache pass");
+        assert_eq!(
+            json["entries"].as_array().unwrap().len(),
+            1,
+            "{pass} cache pass"
+        );
+    }
+
+    let source_cache = sandbox_config_dir(tmp.path())
+        .join("cache")
+        .join("source-message-cache-v2");
+    assert!(
+        source_cache.is_dir(),
+        "the checkpoint-only pass must exercise an existing source cache"
+    );
+    fs::remove_file(primary).unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--client", "openclaw", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totalMessages"].as_i64(), Some(0));
+    assert_eq!(json["totalInput"].as_i64(), Some(0));
+    assert_eq!(json["totalOutput"].as_i64(), Some(0));
+    assert!(json["entries"].as_array().unwrap().is_empty());
 }
 
 /// The Windows regression guard for the two tests below.
@@ -6414,6 +6854,7 @@ fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
     for unreadable in [
         r#"{"colorPalette": "green", "scanner": {"#,
         r#"{"colorPalette": 42, "scanner": {"extraScanPaths": {"claude": ["/data"]}}}"#,
+        r#"{"usage":{"disabledProviders":{"copilot":true}}}"#,
     ] {
         let tmp = create_bucket_timezone_fixture_dir();
         let settings_path = settings_json_path(tmp.path());
@@ -6440,25 +6881,29 @@ fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
 /// contents were never recovered.
 #[test]
 fn test_config_set_refuses_to_overwrite_unreadable_settings() {
-    let tmp = create_bucket_timezone_fixture_dir();
-    let settings_path = settings_json_path(tmp.path());
-    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
-    let unreadable = r#"{"scanner": {"extraScanPaths": "not-a-map"}}"#;
-    fs::write(&settings_path, unreadable).unwrap();
+    for unreadable in [
+        r#"{"scanner": {"extraScanPaths": "not-a-map"}}"#,
+        r#"{"usage":{"disabledProviders":{"copilot":true}}}"#,
+    ] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        let settings_path = settings_json_path(tmp.path());
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, unreadable).unwrap();
 
-    cmd_with_home(tmp.path())
-        .args(["config", "set", "timezone", "Asia/Seoul"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "could not read this machine's tokscale settings",
-        ));
+        cmd_with_home(tmp.path())
+            .args(["config", "set", "timezone", "Asia/Seoul"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "could not read this machine's tokscale settings",
+            ));
 
-    assert_eq!(
-        fs::read_to_string(&settings_path).unwrap(),
-        unreadable,
-        "a refused write must leave the file untouched"
-    );
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            unreadable,
+            "a refused write must leave the file untouched"
+        );
+    }
 }
 
 /// A `bucketTimezone` that does not name a zone the tz database knows is not a

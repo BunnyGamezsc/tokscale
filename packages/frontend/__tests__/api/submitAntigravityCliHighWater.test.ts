@@ -4,6 +4,8 @@ import { resolve } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SUPPORTED_VERSIONED_PARSERS } from "../../src/lib/db/parserHighWater";
+import { ANTIGRAVITY_FAMILY } from "../../src/lib/db/antigravityTransition";
+import type { ClientBreakdownData } from "../../src/lib/db/helpers";
 
 // End-to-end regression for the Antigravity CLI re-attribution.
 //
@@ -158,14 +160,7 @@ function collectStrings(
   }
 }
 
-type StoredBreakdown = Record<
-  string,
-  {
-    tokens: number;
-    cost?: number;
-    provenance?: { costIsComplete?: boolean };
-  }
->;
+type StoredBreakdown = Record<string, ClientBreakdownData>;
 
 type PersistedDay = {
   id: string;
@@ -403,8 +398,15 @@ function installTx(store: Store) {
 function submissionBody(
   client: string,
   days: Array<{ date: string; tokens: number; messages: number }>,
+  retentionFloor?: string,
+  fullFamilyScope = true,
 ) {
   const dates = days.map((day) => day.date).sort();
+  const parserVersions = (ANTIGRAVITY_FAMILY as readonly string[]).includes(client)
+    ? Object.fromEntries(
+        (fullFamilyScope ? ANTIGRAVITY_FAMILY : [client]).map((source) => [source, 1]),
+      )
+    : { [client]: 1 };
   return {
     device: { id: "dev_1", name: "Device one" },
     meta: {
@@ -412,9 +414,15 @@ function submissionBody(
       version: "4.13.0",
       dateRange: { start: dates[0], end: dates[dates.length - 1] },
     },
-    // The CLI declares generation 1 for every client but Copilot, so a real
-    // Antigravity CLI submit carries exactly this.
-    scanScope: { parserVersions: { [client]: 1 }, fullHistory: true },
+    // An unfiltered scan declares all Antigravity family generations even
+    // though de-duplication may leave usage attributed to only one source.
+    scanScope: {
+      parserVersions,
+      fullHistory: true,
+      ...(retentionFloor
+        ? { retentionFloors: { [client]: retentionFloor } }
+        : {}),
+    },
     summary: { clients: [client] },
     years: [],
     contributions: days.map((day) => ({
@@ -470,6 +478,59 @@ async function post(body: object) {
   );
 }
 
+/**
+ * A legacy per-client parser ledger (stateVersion 2) whose credited days are
+ * `days`, each a single gemini-3-pro cell with input-only tokens.
+ */
+function legacyLedger(days: Record<string, { tokens: number; messages: number }>) {
+  const cells: Record<string, ClientBreakdownData> = {};
+  let tokensTotal = 0;
+  let messagesTotal = 0;
+  for (const [date, { tokens, messages }] of Object.entries(days)) {
+    tokensTotal += tokens;
+    messagesTotal += messages;
+    cells[date] = {
+      tokens,
+      cost: tokens / 1000,
+      input: tokens,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages,
+      models: {
+        "gemini-3-pro": {
+          tokens,
+          cost: tokens / 1000,
+          input: tokens,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+          messages,
+        },
+      },
+    };
+  }
+  return {
+    stateVersion: 2,
+    version: 1,
+    baselineEstablished: true,
+    aggregate: {
+      tokens: tokensTotal,
+      input: tokensTotal,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages: messagesTotal,
+      inputIncludingCacheRead: tokensTotal,
+    },
+    days: cells,
+    observedDays: cells,
+  };
+}
+
 // One 12-turn, 240,000-token conversation that ran from the evening of
 // 2026-08-07 into 08-09. The old parser dated every turn at the session start;
 // the new one dates each turn by its generation timestamp. Re-dating moves
@@ -504,7 +565,7 @@ async function submitOldThenNew(client: string) {
   return { store, firstJson, secondJson };
 }
 
-describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
+describe("POST /api/submit Antigravity family high-water", () => {
   it("registers antigravity-cli at the generation the CLI declares", () => {
     // Both re-attributions move a token to a different day and never change
     // the lifetime total, so no installed generation has to be frozen out.
@@ -519,27 +580,30 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
     );
 
     // The old-dating submit stores the whole session on its start day and
-    // establishes the lifetime high-water at that total.
+    // establishes the Antigravity family baseline at that total.
     expect(firstJson.metrics.totalTokens).toBe(240_000);
 
-    // The re-dated rescan carries the SAME 240,000 tokens, so the high-water
-    // credits nothing: the session-start row is preserved untouched and the
-    // generation days add no rows at all.
+    // The re-dated rescan carries the SAME 240,000 tokens, so the family
+    // layout is replaced with its current dates without adding any usage.
     expect(secondJson.metrics.totalTokens).toBe(240_000);
     expect(storedTokens(store)).toBe(240_000);
-    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
-    expect(store.days[0].sourceBreakdown["antigravity-cli"].tokens).toBe(
-      240_000,
-    );
+    expect(store.days.map((day) => day.date).sort()).toEqual([
+      "2026-08-07",
+      "2026-08-08",
+      "2026-08-09",
+    ]);
+    expect(store.days.map((day) => day.sourceBreakdown["antigravity-cli"].tokens).sort((a, b) => a - b)).toEqual([
+      40_000,
+      80_000,
+      120_000,
+    ]);
 
-    // The high-water state persisted on the device row is what the next
-    // submit bounds against.
-    expect(store.device.parserVersions["antigravity-cli"]).toBe(1);
-    expect(
-      (store.device.parserStates["antigravity-cli"] as {
-        aggregate: { tokens: number };
-      }).aggregate.tokens,
-    ).toBe(240_000);
+    // All source generations are persisted together so a copied response
+    // cannot acquire a fresh client-specific baseline later.
+    for (const client of ANTIGRAVITY_FAMILY) {
+      expect(store.device.parserVersions[client]).toBe(1);
+      expect(store.device.parserStates[client]).toBeUndefined();
+    }
   });
 
   it("still credits genuinely new antigravity-cli usage after the re-dating", async () => {
@@ -584,18 +648,7 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
       store.days.find((day) => day.date === "2026-08-07")?.sourceBreakdown[
         "antigravity-cli"
       ].tokens,
-    ).toBe(240_000);
-
-    const state = store.device.parserStates["antigravity-cli"] as {
-      aggregate: { tokens: number };
-      days: Record<string, { tokens: number }>;
-      observedDays: Record<string, { tokens: number }>;
-    };
-    expect(state.aggregate.tokens).toBe(260_000);
-    expect(
-      Object.values(state.days).reduce((sum, day) => sum + day.tokens, 0),
-    ).toBe(260_000);
-    expect(state.observedDays["2026-08-07"].tokens).toBe(60_000);
+    ).toBe(60_000);
 
     // The credited ledger, not the parser's cellwise envelope, is the next
     // lifetime baseline. Replaying the same snapshot therefore adds nothing.
@@ -605,11 +658,138 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
     expect(replay.status).toBe(200);
     expect((await replay.json()).metrics.totalTokens).toBe(260_000);
     expect(storedTokens(store)).toBe(260_000);
+  });
+
+  it("reports the deficit when the store ages history out from under the high-water", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", SESSION_START_DATING);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    // The CLI keeps a rolling conversation store, so weeks later a full scan
+    // no longer reaches the credited session at all: it reports 90,000
+    // genuinely new tokens against a 240,000 credited lifetime.
+    installTx(store);
+    const aged = submissionBody("antigravity-cli", [
+      { date: "2026-09-01", tokens: 90_000, messages: 5 },
+    ]);
+    mockSubmit(aged);
+    const response = await post(aged);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    // The bound holds, which is the point of the registry entry: a snapshot
+    // below the credited lifetime is indistinguishable from a re-attribution.
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+
+    // What must not happen silently. Without the warning this response is
+    // identical to one that stored everything.
     expect(
-      (store.device.parserStates["antigravity-cli"] as {
-        aggregate: { tokens: number };
-      }).aggregate.tokens,
-    ).toBe(260_000);
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps the lifetime bound when an unverified retention floor clears the stored days", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", SESSION_START_DATING);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    // A client-controlled floor cannot establish that the old session was
+    // actually pruned rather than moved to this newly dated cell.
+    installTx(store);
+    const aged = submissionBody(
+      "antigravity-cli",
+      [{ date: "2026-09-01", tokens: 90_000, messages: 5 }],
+      "2026-09-01",
+    );
+    mockSubmit(aged);
+    const response = await post(aged);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+    expect(
+      (json.warnings ?? []).some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes every family source when the incoming snapshot no longer covers its credited usage", async () => {
+    const store = newStore();
+    const first = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    const smaller = submissionBody("antigravity-cli", [
+      { date: "2026-09-01", tokens: 90_000, messages: 20 },
+    ], "2026-08-07");
+    installTx(store);
+    mockSubmit(smaller);
+    const response = await post(smaller);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+    expect(json.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("Preserved Antigravity sources together"),
+    ]));
+  });
+
+  it("credits nothing when a re-attribution happens under a retention floor", async () => {
+    const store = newStore();
+    installTx(store);
+    const first = submissionBody("antigravity-cli", SESSION_START_DATING);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    // The floor is derived from session start times still on disk, so a
+    // re-dated session keeps its own start: the floor does not advance past
+    // the credited day and the lifetime bound still sees all 240,000.
+    installTx(store);
+    const rescan = submissionBody(
+      "antigravity-cli",
+      PER_GENERATION_DATING,
+      "2026-08-07",
+    );
+    mockSubmit(rescan);
+    const response = await post(rescan);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(240_000);
+  });
+
+  it("ignores a retention floor contradicted by an older incoming day", async () => {
+    const store = newStore();
+    const first = submissionBody("antigravity-cli", [
+      { date: "2026-08-07", tokens: 100_000, messages: 5 },
+      { date: "2026-08-08", tokens: 200_000, messages: 5 },
+    ]);
+    installTx(store);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    const moved = submissionBody("antigravity-cli", [
+      { date: "2026-08-07", tokens: 100_000, messages: 5 },
+      { date: "2026-09-01", tokens: 200_000, messages: 5 },
+    ], "2026-08-08");
+    for (let replay = 0; replay < 2; replay++) {
+      installTx(store);
+      mockSubmit(moved);
+      const response = await post(moved);
+      expect(response.status).toBe(200);
+      expect((await response.json()).metrics.totalTokens).toBe(300_000);
+      expect(store.days.map(({ date }) => date).sort()).toEqual(["2026-08-07", "2026-09-01"]);
+    }
   });
 
   it("still inflates for a client that is legitimately not registered", async () => {
@@ -642,15 +822,365 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
   });
 });
 
-describe("POST /api/submit antigravity (IDE) re-attribution high-water", () => {
-  // The IDE-backed client shares the sync that writes the artifacts, and #1151
-  // stopped standalone usage rows falling back to the session-created date:
-  // they are now correlated to trajectory-step timestamps. That is the same
-  // re-attribution shape as the CLI client, on a different client id, so it
-  // needs the same lifetime bound. The harness above is client-id agnostic,
-  // so these reuse it directly.
+describe("POST /api/submit Antigravity source-family re-attribution", () => {
   it("registers antigravity at the generation the CLI declares", () => {
     expect(SUPPORTED_VERSIONED_PARSERS.antigravity).toBe(1);
+  });
+
+  it("registers Antigravity IDE Extensions at generation 1", () => {
+    expect(SUPPORTED_VERSIONED_PARSERS["antigravity-extension"]).toBe(1);
+  });
+
+  it("does not count a response again when its source changes to the IDE extension", async () => {
+    const store = newStore();
+    const desktopBody = submissionBody("antigravity", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(desktopBody);
+    expect((await post(desktopBody)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const extensionBody = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+    );
+    installTx(store);
+    mockSubmit(extensionBody);
+    const response = await post(extensionBody);
+    expect(response.status).toBe(200);
+    expect((await response.json()).metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.days).toHaveLength(1);
+    expect(store.days[0].sourceBreakdown.antigravity).toBeUndefined();
+    expect(
+      store.days[0].sourceBreakdown["antigravity-extension"].tokens,
+    ).toBe(240_000);
+    for (const client of ANTIGRAVITY_FAMILY) {
+      expect(store.device.parserVersions[client]).toBe(1);
+      expect(store.device.parserStates[client]).toBeUndefined();
+    }
+  });
+
+  it("preserves legacy client high-water state until the family snapshot covers it", async () => {
+    const store = newStore();
+    const initial = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(initial);
+    expect((await post(initial)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const highWaterCell: ClientBreakdownData = {
+      tokens: 300_000,
+      cost: 0,
+      input: 300_000,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages: 15,
+      models: {
+        "gemini-3-pro": {
+          tokens: 300_000,
+          cost: 0,
+          input: 300_000,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+          messages: 15,
+        },
+      },
+    };
+    const previousState = {
+      stateVersion: 2,
+      version: 1,
+      baselineEstablished: true,
+      aggregate: {
+        tokens: 300_000,
+        input: 300_000,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 15,
+        inputIncludingCacheRead: 300_000,
+      },
+      days: { "2026-08-07": highWaterCell },
+      observedDays: { "2026-08-07": highWaterCell },
+    };
+    store.device.parserStates["antigravity-cli"] = previousState;
+
+    const underCovered = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+    );
+    installTx(store);
+    mockSubmit(underCovered);
+    const underCoveredResponse = await post(underCovered);
+    expect(underCoveredResponse.status).toBe(200);
+    const underCoveredJson = await underCoveredResponse.json();
+    expect(underCoveredJson.metrics.totalTokens).toBe(240_000);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+    expect(store.days[0].sourceBreakdown["antigravity-cli"].tokens).toBe(
+      240_000,
+    );
+    expect(store.device.parserStates["antigravity-cli"]).toEqual(previousState);
+    expect(
+      underCoveredJson.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+
+    const covered = submissionBody("antigravity-extension", [
+      { date: "2026-08-10", tokens: 320_000, messages: 16 },
+    ]);
+    installTx(store);
+    mockSubmit(covered);
+    const coveredResponse = await post(covered);
+    expect(coveredResponse.status).toBe(200);
+    expect((await coveredResponse.json()).metrics.totalTokens).toBe(320_000);
+    expect(storedTokens(store)).toBe(320_000);
+    expect(store.device.parserStates["antigravity-cli"]).toBeUndefined();
+  });
+
+  it("replaces (not freezes) when both legacy ledgers hold the same response", async () => {
+    // Pre-transition device: the same 240,000-token response was submitted
+    // from two family surfaces, so it sits in both legacy parser ledgers
+    // while the stored day breakdown holds one copy. The identical
+    // (date, model) cell proves the overlap and counts once, so the first
+    // full-history family snapshot covering 240,000 must replace the layout
+    // -- not freeze against a summed 480,000.
+    const store = newStore();
+    const initial = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(initial);
+    expect((await post(initial)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const sameResponse = { "2026-08-07": { tokens: 240_000, messages: 12 } };
+    store.device.parserStates["antigravity"] = legacyLedger(sameResponse);
+    store.device.parserStates["antigravity-cli"] = legacyLedger(sameResponse);
+
+    const transition = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+    );
+    installTx(store);
+    mockSubmit(transition);
+    const response = await post(transition);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    // Replace mode reconciles the family with a "Reconciled" notice; the
+    // freeze-mode "Preserved" warning must NOT appear.
+    expect(
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(false);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+    expect(
+      store.days[0].sourceBreakdown["antigravity-extension"].tokens,
+    ).toBe(240_000);
+    expect(store.device.parserStates["antigravity"]).toBeUndefined();
+    expect(store.device.parserStates["antigravity-cli"]).toBeUndefined();
+  });
+
+  it("replaces a covered snapshot below the summed bound when the ledgers overlap", async () => {
+    // Same dual-ledger device. The snapshot totals 360,000, strictly between
+    // the proven single-copy coverage (240,000) and the summed ledgers
+    // (480,000). With the overlap counted once it replaces and credits
+    // 360,000; summing the ledgers would freeze it at the stored 240,000.
+    const store = newStore();
+    const initial = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(initial);
+    expect((await post(initial)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const sameResponse = { "2026-08-07": { tokens: 240_000, messages: 12 } };
+    store.device.parserStates["antigravity"] = legacyLedger(sameResponse);
+    store.device.parserStates["antigravity-cli"] = legacyLedger(sameResponse);
+
+    const grown = submissionBody("antigravity-extension", [
+      { date: "2026-08-07", tokens: 200_000, messages: 10 },
+      { date: "2026-08-10", tokens: 160_000, messages: 8 },
+    ]);
+    installTx(store);
+    mockSubmit(grown);
+    const response = await post(grown);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(360_000);
+    expect(storedTokens(store)).toBe(360_000);
+    expect(
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(false);
+    expect(store.days.map((day) => day.date).sort()).toEqual([
+      "2026-08-07",
+      "2026-08-10",
+    ]);
+    expect(store.device.parserStates["antigravity"]).toBeUndefined();
+    expect(store.device.parserStates["antigravity-cli"]).toBeUndefined();
+  });
+
+  it("replaces when the two legacy ledgers date one conversation differently", async () => {
+    // Re-dated overlap: the desktop ledger holds the conversation at its
+    // session start (08-07) and the CLI ledger per generation (08-07..08-09).
+    // No (date, model) cell matches, but both record the same 240,000-token,
+    // 12-message lifetime on the same models with a shared date, so they are
+    // one lifetime and a correct 240,000 snapshot must replace, not freeze
+    // against a summed 480,000.
+    const store = newStore();
+    const initial = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(initial);
+    expect((await post(initial)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const dated = (days: typeof PER_GENERATION_DATING) =>
+      Object.fromEntries(
+        days.map(({ date, tokens, messages }) => [date, { tokens, messages }]),
+      );
+    store.device.parserStates["antigravity"] = legacyLedger(dated(SESSION_START_DATING));
+    store.device.parserStates["antigravity-cli"] = legacyLedger(dated(PER_GENERATION_DATING));
+
+    const transition = submissionBody("antigravity-extension", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(transition);
+    const response = await post(transition);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(storedTokens(store)).toBe(240_000);
+    expect(
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(false);
+    expect(store.device.parserStates["antigravity"]).toBeUndefined();
+    expect(store.device.parserStates["antigravity-cli"]).toBeUndefined();
+  });
+
+  it("freezes instead of dropping credit when legacy ledgers hold distinct usage", async () => {
+    // Separate sessions: the desktop ledger credited 240,000 on 08-05 and the
+    // CLI ledger 240,000 on 08-07, so the credited lifetime is 480,000 even
+    // though only the 08-07 day is retained in stored days. Nothing proves an
+    // overlap, so a 360,000 snapshot does not cover the lifetime. It must
+    // freeze with the ledgers kept, not replace and silently drop 120,000.
+    const store = newStore();
+    const initial = submissionBody("antigravity-cli", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(initial);
+    expect((await post(initial)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const desktop = legacyLedger({ "2026-08-05": { tokens: 240_000, messages: 12 } });
+    const cli = legacyLedger({ "2026-08-07": { tokens: 240_000, messages: 12 } });
+    store.device.parserStates["antigravity"] = desktop;
+    store.device.parserStates["antigravity-cli"] = cli;
+
+    const snapshot = submissionBody("antigravity-extension", [
+      { date: "2026-08-07", tokens: 200_000, messages: 10 },
+      { date: "2026-08-10", tokens: 160_000, messages: 8 },
+    ]);
+    installTx(store);
+    mockSubmit(snapshot);
+    const response = await post(snapshot);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.device.parserStates["antigravity"]).toEqual(desktop);
+    expect(store.device.parserStates["antigravity-cli"]).toEqual(cli);
+    expect(
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps an unsupported incoming generation so an older parser cannot replace it", async () => {
+    const store = newStore();
+    const future = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+    );
+    future.scanScope.parserVersions["antigravity-extension"] = 2;
+
+    installTx(store);
+    mockSubmit(future);
+    const futureResponse = await post(future);
+    expect(futureResponse.status).toBe(200);
+    expect((await futureResponse.json()).metrics.totalTokens).toBe(0);
+    expect(store.device.parserVersions).toEqual({ "antigravity-extension": 2 });
+    expect(store.days).toHaveLength(0);
+
+    const older = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+    );
+    installTx(store);
+    mockSubmit(older);
+    const olderResponse = await post(older);
+    expect(olderResponse.status).toBe(200);
+    const olderJson = await olderResponse.json();
+    expect(olderJson.metrics.totalTokens).toBe(0);
+    expect(store.device.parserVersions["antigravity-extension"]).toBe(2);
+    expect(store.days).toHaveLength(0);
+    expect(
+      olderJson.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes a client-filtered scan until the complete Antigravity family is submitted", async () => {
+    const store = newStore();
+    const desktopBody = submissionBody("antigravity", SESSION_START_DATING);
+    installTx(store);
+    mockSubmit(desktopBody);
+    expect((await post(desktopBody)).status).toBe(200);
+    expect(storedTokens(store)).toBe(240_000);
+
+    const filteredExtension = submissionBody(
+      "antigravity-extension",
+      SESSION_START_DATING,
+      undefined,
+      false,
+    );
+    installTx(store);
+    mockSubmit(filteredExtension);
+    const response = await post(filteredExtension);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.days[0].sourceBreakdown.antigravity).toBeDefined();
+    expect(store.days[0].sourceBreakdown["antigravity-extension"]).toBeUndefined();
+    expect(
+      json.warnings.some((warning: string) =>
+        warning.includes("Preserved Antigravity sources together"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps the total flat when extension generations move to their event dates", async () => {
+    const { store, firstJson, secondJson } = await submitOldThenNew(
+      "antigravity-extension",
+    );
+
+    expect(firstJson.metrics.totalTokens).toBe(240_000);
+    expect(secondJson.metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.days.map((day) => day.date).sort()).toEqual(
+      PER_GENERATION_DATING.map((day) => day.date),
+    );
+    expect(store.device.parserVersions["antigravity-extension"]).toBe(1);
   });
 
   it("does not raise the stored total when standalone rows are re-dated", async () => {
@@ -661,8 +1191,14 @@ describe("POST /api/submit antigravity (IDE) re-attribution high-water", () => {
     expect(firstJson.metrics.totalTokens).toBe(240_000);
     expect(secondJson.metrics.totalTokens).toBe(240_000);
     expect(storedTokens(store)).toBe(240_000);
-    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
-    expect(store.device.parserVersions.antigravity).toBe(1);
+    expect(store.days.map((day) => day.date).sort()).toEqual([
+      "2026-08-07",
+      "2026-08-08",
+      "2026-08-09",
+    ]);
+    for (const client of ANTIGRAVITY_FAMILY) {
+      expect(store.device.parserVersions[client]).toBe(1);
+    }
   });
 
   it("still credits genuinely new antigravity usage after the re-dating", async () => {
@@ -687,6 +1223,225 @@ describe("POST /api/submit antigravity (IDE) re-attribution high-water", () => {
 });
 
 describe("POST /api/submit droid snapshot layout", () => {
+  function snapshotBody(
+    days: Array<{
+      date: string;
+      costIsComplete: boolean;
+      models: Array<{ modelId: string; tokens: number; cost: number; messages: number }>;
+    }>,
+  ) {
+    const body = submissionBody("droid", []);
+    const dates = days.map(({ date }) => date).sort();
+    return {
+      ...body,
+      meta: { ...body.meta, dateRange: { start: dates[0], end: dates[dates.length - 1] } },
+      contributions: days.map((day) => ({
+        date: day.date,
+        totals: { costIsComplete: day.costIsComplete },
+        clients: day.models.map((model) => ({
+          client: "droid",
+          modelId: model.modelId,
+          tokens: { input: model.tokens, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          cost: model.cost,
+          messages: model.messages,
+        })),
+      })),
+    };
+  }
+
+  async function submitSnapshot(store: Store, body: ReturnType<typeof snapshotBody>) {
+    installTx(store);
+    mockSubmit(body);
+    const response = await post(body);
+    expect(response.status).toBe(200);
+    return response.json();
+  }
+
+  function expectSnapshotLayout(store: Store, body: ReturnType<typeof snapshotBody>) {
+    for (const day of body.contributions) {
+      const cell = store.days.find((stored) => stored.date === day.date)!.sourceBreakdown.droid;
+      expect(Object.keys(cell.models).sort()).toEqual(day.clients.map(({ modelId }) => modelId).sort());
+      for (const client of day.clients) {
+        expect(cell.models[client.modelId]).toMatchObject({
+          tokens: client.tokens.input,
+          input: client.tokens.input,
+          messages: client.messages,
+        });
+      }
+      const models = Object.values(cell.models);
+      expect(cell.tokens).toBe(models.reduce((sum, model) => sum + model.tokens, 0));
+      expect(cell.messages).toBe(models.reduce((sum, model) => sum + model.messages, 0));
+      expect(cell.cost).toBeCloseTo(models.reduce((sum, model) => sum + model.cost, 0), 8);
+    }
+  }
+
+  const originalSnapshot = () => snapshotBody([{
+    date: "2026-08-07",
+    costIsComplete: false,
+    models: [
+      { modelId: "gemini-3-pro", tokens: 100_000, cost: 100, messages: 2 },
+      { modelId: "unknown", tokens: 2, cost: 0, messages: 2 },
+    ],
+  }]);
+
+  it.each([false, true])("reconciles overlapping partially priced days once per lifetime (legacy=%s)", async (legacy) => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    if (legacy) {
+      store.device.parserVersions = {};
+      store.device.parserStates = {};
+    }
+    const rewritten = snapshotBody([
+      { date: "2026-08-07", costIsComplete: false, models: [
+        { modelId: "gemini-3-pro", tokens: 40_000, cost: 40, messages: 1 },
+        { modelId: "unknown", tokens: 1, cost: 0, messages: 1 },
+      ] },
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { modelId: "gemini-3-pro", tokens: 60_000, cost: 60, messages: 1 },
+        { modelId: "unknown", tokens: 1, cost: 0, messages: 1 },
+      ] },
+    ]);
+    for (let replay = 0; replay < 3; replay++) {
+      const json = await submitSnapshot(store, rewritten);
+      expectSnapshotLayout(store, rewritten);
+      expect(storedTokens(store)).toBe(100_002);
+      expect(storedCost(store)).toBe(100);
+      expect(json.metrics.totalCost).toBe(100);
+      expect(store.days.every(({ sourceBreakdown }) => sourceBreakdown.droid.provenance?.costIsComplete === false)).toBe(true);
+    }
+  });
+
+  it("removes moved models from an incomplete source day without duplicating their cost", async () => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    const rewritten = snapshotBody([
+      { date: "2026-08-07", costIsComplete: false, models: [
+        { modelId: "unknown", tokens: 2, cost: 0, messages: 2 },
+      ] },
+      { date: "2026-08-08", costIsComplete: true, models: [
+        { modelId: "gemini-3-pro", tokens: 100_000, cost: 100, messages: 2 },
+      ] },
+    ]);
+    for (let replay = 0; replay < 2; replay++) {
+      await submitSnapshot(store, rewritten);
+      expectSnapshotLayout(store, rewritten);
+      expect(storedCost(store)).toBe(100);
+    }
+  });
+
+  it("keeps only the lifetime deficit across replays and clears it when pricing recovers", async () => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    const rewritten = snapshotBody([
+      { date: "2026-08-07", costIsComplete: false, models: [
+        { modelId: "gemini-3-pro", tokens: 40_000, cost: 10, messages: 1 },
+        { modelId: "unknown", tokens: 1, cost: 0, messages: 1 },
+      ] },
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { modelId: "gemini-3-pro", tokens: 60_000, cost: 20, messages: 1 },
+        { modelId: "unknown", tokens: 1, cost: 0, messages: 1 },
+      ] },
+    ]);
+    await submitSnapshot(store, rewritten);
+    expect(storedCost(store)).toBeCloseTo(100, 8);
+    expectSnapshotLayout(store, rewritten);
+    const beforeReplay = structuredClone(store.days);
+    await submitSnapshot(store, rewritten);
+    expect(store.days).toEqual(beforeReplay);
+
+    // A complete resubmit supplies the authoritative price and may correct
+    // a prior floor downward, including cost inflated by the old merge.
+    for (const day of rewritten.contributions) day.totals.costIsComplete = true;
+    await submitSnapshot(store, rewritten);
+    expect(storedCost(store)).toBe(30);
+    expectSnapshotLayout(store, rewritten);
+    expect(store.days.every(({ sourceBreakdown }) => sourceBreakdown.droid.provenance?.costIsComplete !== false)).toBe(true);
+  });
+
+  it("keeps rounding residuals on the same dates and models after new rows become updates", async () => {
+    const store = newStore();
+    const models = ["z-model", "a-model", "m-model", "b-model"].map((modelId) => ({
+      modelId, tokens: 1, cost: 0, messages: 1,
+    }));
+    const original = snapshotBody([{
+      date: "2026-08-07", costIsComplete: false,
+      models: models.map((model, index) => ({ ...model, cost: index === 0 ? 0.0014 : 0 })),
+    }]);
+    await submitSnapshot(store, original);
+    const rewritten = snapshotBody(["2026-08-07", "2026-08-08", "2026-08-09", "2026-08-10"].map((date) => ({
+      date, costIsComplete: false, models,
+    })));
+    await submitSnapshot(store, rewritten);
+    expect(storedCost(store)).toBeCloseTo(0.0014, 10);
+    expectSnapshotLayout(store, rewritten);
+    const beforeReplay = structuredClone(store.days);
+    await submitSnapshot(store, rewritten);
+    expect(store.days).toEqual(beforeReplay);
+    rewritten.contributions.reverse();
+    for (const day of rewritten.contributions) day.clients.reverse();
+    await submitSnapshot(store, rewritten);
+    expect(store.days).toEqual(beforeReplay);
+    expectSnapshotLayout(store, rewritten);
+  });
+
+  it("allocates a lifetime deficit only to incomplete Droid days", async () => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    const rewritten = snapshotBody([
+      { date: "2026-08-07", costIsComplete: false, models: [
+        { modelId: "unknown", tokens: 2, cost: 0, messages: 2 },
+      ] },
+      { date: "2026-08-08", costIsComplete: true, models: [
+        { modelId: "gemini-3-pro", tokens: 100_000, cost: 60, messages: 2 },
+      ] },
+    ]);
+    for (let replay = 0; replay < 3; replay++) {
+      await submitSnapshot(store, rewritten);
+      expectSnapshotLayout(store, rewritten);
+      expect(storedCost(store)).toBe(100);
+      const incomplete = store.days.find(({ date }) => date === "2026-08-07")!.sourceBreakdown.droid;
+      const complete = store.days.find(({ date }) => date === "2026-08-08")!.sourceBreakdown.droid;
+      expect(incomplete.cost).toBe(40);
+      expect(incomplete.provenance?.costIsComplete).toBe(false);
+      expect(complete.cost).toBe(60);
+      expect(complete.models["gemini-3-pro"].cost).toBe(60);
+      expect(complete.provenance?.costIsComplete).not.toBe(false);
+    }
+  });
+
+  it("repairs previously retained model tokens and lets complete pricing correct inflated spend", async () => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    // Model the already-persisted shape produced by the old day-floor merge.
+    const oldCell = store.days[0].sourceBreakdown.droid;
+    oldCell.models["moved-model"] = { ...oldCell.models["gemini-3-pro"], cost: 60 };
+    oldCell.cost = 160;
+
+    const incomplete = originalSnapshot();
+    await submitSnapshot(store, incomplete);
+    expectSnapshotLayout(store, incomplete);
+    expect(storedCost(store)).toBe(160);
+    const complete = originalSnapshot();
+    complete.contributions[0].totals.costIsComplete = true;
+    await submitSnapshot(store, complete);
+    expectSnapshotLayout(store, complete);
+    expect(storedCost(store)).toBe(100);
+  });
+
+  it("freezes an incomplete partial rescan after a replacement", async () => {
+    const store = newStore();
+    await submitSnapshot(store, originalSnapshot());
+    await submitSnapshot(store, originalSnapshot());
+    const beforePartial = structuredClone(store.days);
+    const partial = snapshotBody([{
+      date: "2026-08-09", costIsComplete: false,
+      models: [{ modelId: "gemini-3-pro", tokens: 200_000, cost: 20, messages: 5 }],
+    }]);
+    partial.scanScope.fullHistory = false;
+    await submitSnapshot(store, partial);
+    expect(store.days).toEqual(beforePartial);
+  });
+
   it("replaces stored Droid days when a full snapshot re-dates the same lifetime", async () => {
     const { store, firstJson, secondJson } = await submitOldThenNew("droid");
 
@@ -741,7 +1496,8 @@ describe("POST /api/submit droid snapshot layout", () => {
 
     const startDay = store.days.find((day) => day.date === "2026-08-07");
     expect(startDay?.sourceBreakdown.droid.tokens).toBe(40_000);
-    expect(Number(startDay?.sourceBreakdown.droid.cost)).toBe(240);
+    expect(Number(startDay?.sourceBreakdown.droid.cost)).toBe(40);
+    expect(storedCost(store)).toBe(240);
     expect(startDay?.sourceBreakdown.droid.provenance?.costIsComplete).toBe(
       false,
     );
@@ -838,6 +1594,31 @@ function droidAndClaudeBody(
 }
 
 describe("POST /api/submit droid snapshot layout sibling clients", () => {
+  it("does not floor complete Droid pricing because another client's day is incomplete", async () => {
+    const store = newStore();
+    const first = droidAndClaudeBody([
+      { date: "2026-08-07", droid: 100_000 },
+      { date: "2026-08-08", claude: 1_000 },
+    ]);
+    installTx(store);
+    mockSubmit(first);
+    expect((await post(first)).status).toBe(200);
+
+    const corrected = droidAndClaudeBody([
+      { date: "2026-08-07", droid: 100_000 },
+      { date: "2026-08-08", claude: 1_000 },
+    ]);
+    corrected.contributions[0].clients[0].cost = 50;
+    Object.assign(corrected.contributions[1], { totals: { costIsComplete: false } });
+    installTx(store);
+    mockSubmit(corrected);
+    expect((await post(corrected)).status).toBe(200);
+    const droid = store.days.find(({ date }) => date === "2026-08-07")!.sourceBreakdown.droid;
+    expect(droid.cost).toBe(50);
+    expect(droid.provenance?.costIsComplete).not.toBe(false);
+    expect(store.days.find(({ date }) => date === "2026-08-08")!.sourceBreakdown.claude.cost).toBe(1);
+  });
+
   it("does not report a sibling client as disappeared from a day the snapshot only emptied of Droid", async () => {
     const store = newStore();
 
@@ -915,5 +1696,204 @@ describe("submission date range aggregate", () => {
     );
     expect(migration).toContain('"date_start" date NOT NULL');
     expect(migration).toContain('"date_end" date NOT NULL');
+  });
+});
+
+describe("POST /api/submit Antigravity family cost floors", () => {
+  function familySnapshotBody(
+    days: Array<{
+      date: string;
+      costIsComplete: boolean;
+      models: Array<{ client: string; modelId: string; tokens: number; cost: number; messages: number }>;
+    }>,
+  ) {
+    const body = submissionBody("antigravity", []);
+    const dates = days.map(({ date }) => date).sort();
+    const clients = [...new Set(days.flatMap((day) => day.models.map((model) => model.client)))];
+    return {
+      ...body,
+      meta: { ...body.meta, dateRange: { start: dates[0], end: dates[dates.length - 1] } },
+      summary: { clients },
+      contributions: days.map((day) => ({
+        date: day.date,
+        totals: { costIsComplete: day.costIsComplete },
+        clients: day.models.map((model) => ({
+          client: model.client,
+          modelId: model.modelId,
+          tokens: { input: model.tokens, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          cost: model.cost,
+          messages: model.messages,
+        })),
+      })),
+    };
+  }
+
+  async function submitFamily(store: Store, body: ReturnType<typeof familySnapshotBody>) {
+    installTx(store);
+    mockSubmit(body);
+    const response = await post(body);
+    expect(response.status).toBe(200);
+    return response.json();
+  }
+
+  it("credits Antigravity tokens when a full-family scan contains an unpriced model", async () => {
+    const store = newStore();
+    const unpricedSnapshot = (flashTokens: number) =>
+      familySnapshotBody([
+        {
+          date: "2026-08-07",
+          costIsComplete: false,
+          models: [
+            { client: "antigravity-cli", modelId: "gemini-3-pro", tokens: 1_000_000_000, cost: 0, messages: 5 },
+            { client: "antigravity-extension", modelId: "gemini-3-flash", tokens: flashTokens, cost: 21, messages: 7 },
+          ],
+        },
+      ]);
+
+    const first = await submitFamily(store, unpricedSnapshot(2_100_000_000));
+    expect(first.metrics.totalTokens).toBe(3_100_000_000);
+    expect(storedTokens(store)).toBe(3_100_000_000);
+    // The known partial cost is kept as-is; no price is invented for the
+    // unpriced model.
+    expect(storedCost(store)).toBeCloseTo(21, 8);
+    // Incompleteness is visible on every stored family cell's provenance.
+    expect(
+      store.days.every((day) =>
+        Object.values(day.sourceBreakdown).every(
+          (cell) => cell.provenance?.costIsComplete === false,
+        ),
+      ),
+    ).toBe(true);
+
+    // An identical replay credits nothing again.
+    await submitFamily(store, unpricedSnapshot(2_100_000_000));
+    expect(storedTokens(store)).toBe(3_100_000_000);
+    expect(storedCost(store)).toBeCloseTo(21, 8);
+
+    // Growth on a later full-history snapshot that still contains the
+    // unpriced history must not stay frozen.
+    await submitFamily(store, unpricedSnapshot(2_200_000_000));
+    expect(storedTokens(store)).toBe(3_200_000_000);
+  });
+
+  it("preserves the Antigravity family cost floor when unpriced usage moves source and date", async () => {
+    const store = newStore();
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-07", costIsComplete: true, models: [
+        { client: "antigravity", modelId: "gemini-3-pro", tokens: 100, cost: 10, messages: 2 },
+      ] },
+    ]));
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+
+    // The same usage moves to the IDE extension on a new date, unpriced.
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 100, cost: 0, messages: 2 },
+      ] },
+    ]));
+    expect(storedTokens(store)).toBe(100);
+    expect(store.days).toHaveLength(1);
+    expect(store.days[0].date).toBe("2026-08-08");
+    // The credited lifetime spend survived the source move.
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+    expect(
+      store.days[0].sourceBreakdown["antigravity-extension"]?.provenance
+        ?.costIsComplete,
+    ).toBe(false);
+
+    // Replay: the floor is restored once, not compounded.
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 100, cost: 0, messages: 2 },
+      ] },
+    ]));
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+  });
+
+  it("floors the family lifetime once: known per-model spend is not stacked", async () => {
+    const store = newStore();
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-07", costIsComplete: true, models: [
+        { client: "antigravity", modelId: "gemini-3-pro", tokens: 100, cost: 10, messages: 2 },
+      ] },
+    ]));
+
+    // The replacement reports the old model unpriced (incomplete, $0) plus a
+    // newly priced model at $5. The family floor is a LIFETIME scalar, not a
+    // per-model preservation: the known total $10 stands, the $5 counts
+    // toward it, and the $5 deficit lands on the incomplete cell. Per-model
+    // floors would stack to $15.
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { client: "antigravity-cli", modelId: "gemini-3-pro", tokens: 60, cost: 0, messages: 1 },
+      ] },
+      { date: "2026-08-09", costIsComplete: true, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 40, cost: 5, messages: 1 },
+      ] },
+    ]));
+    expect(storedTokens(store)).toBe(100);
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+    const cliDay = store.days.find((day) => day.sourceBreakdown["antigravity-cli"])!;
+    expect(cliDay.sourceBreakdown["antigravity-cli"]!.cost).toBeCloseTo(5, 8);
+    const extensionDay = store.days.find((day) => day.sourceBreakdown["antigravity-extension"])!;
+    expect(extensionDay.sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(5, 8);
+  });
+
+  it("keeps complete Antigravity cells exact while flooring only incomplete cells", async () => {
+    const store = newStore();
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-07", costIsComplete: true, models: [
+        { client: "antigravity", modelId: "gemini-3-pro", tokens: 100, cost: 10, messages: 2 },
+      ] },
+    ]));
+
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-07", costIsComplete: true, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 60, cost: 7, messages: 1 },
+      ] },
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { client: "antigravity-cli", modelId: "gemini-3-pro", tokens: 40, cost: 0, messages: 1 },
+      ] },
+    ]));
+
+    const complete = store.days.find((day) => day.date === "2026-08-07")!;
+    const incomplete = store.days.find((day) => day.date === "2026-08-08")!;
+    expect(complete.sourceBreakdown["antigravity-extension"]!.cost).toBeCloseTo(7, 8);
+    // The $3 deficit lands on the incomplete cell only.
+    expect(incomplete.sourceBreakdown["antigravity-cli"]!.cost).toBeCloseTo(3, 8);
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+  });
+
+  it("clears the Antigravity cost floor when full pricing recovers", async () => {
+    const store = newStore();
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-07", costIsComplete: true, models: [
+        { client: "antigravity", modelId: "gemini-3-pro", tokens: 100, cost: 10, messages: 2 },
+      ] },
+    ]));
+    await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-08", costIsComplete: false, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 100, cost: 0, messages: 2 },
+      ] },
+    ]));
+    expect(storedCost(store)).toBeCloseTo(10, 8);
+
+    // A fully priced snapshot of the same coverage replaces exactly,
+    // including downward, and clears the incompleteness.
+    const recovered = await submitFamily(store, familySnapshotBody([
+      { date: "2026-08-09", costIsComplete: true, models: [
+        { client: "antigravity-extension", modelId: "gemini-3-pro", tokens: 100, cost: 6, messages: 2 },
+      ] },
+    ]));
+    expect(recovered.metrics.totalCost).toBeCloseTo(6, 8);
+    expect(storedCost(store)).toBeCloseTo(6, 8);
+    expect(storedTokens(store)).toBe(100);
+    expect(
+      store.days.every((day) =>
+        Object.values(day.sourceBreakdown).every(
+          (cell) => cell.provenance?.costIsComplete !== false,
+        ),
+      ),
+    ).toBe(true);
   });
 });

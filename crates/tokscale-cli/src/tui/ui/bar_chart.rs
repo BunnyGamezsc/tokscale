@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 
 use super::widgets::format_tokens;
 use crate::tui::app::App;
+use crate::tui::i18n::{tr, MessageKey};
 
 /// 8-level block characters for sub-cell precision (matching OpenTUI)
 const BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -61,20 +62,19 @@ pub fn render_stacked_bar_chart(frame: &mut Frame, app: &App, area: Rect, data: 
     };
 
     // Title
+    let lang = app.settings.tui_language;
     let title = if is_very_narrow {
-        "Tokens"
+        tr(lang, MessageKey::ChartTokens)
     } else {
-        "Tokens per Day"
+        tr(lang, MessageKey::ChartTokensPerDay)
     };
     let title_y = area.y;
-    for (i, ch) in title.chars().enumerate() {
-        let x = area.x + y_label_width + i as u16;
-        if x < area.x + area.width {
-            buf[(x, title_y)]
-                .set_char(ch)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
-        }
-    }
+    buf.set_string(
+        area.x + y_label_width,
+        title_y,
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    );
 
     // Render bars row by row (from top to bottom visually, which is high values to low)
     for row_from_bottom in (0..chart_height).rev() {
@@ -87,7 +87,7 @@ pub fn render_stacked_bar_chart(frame: &mut Frame, app: &App, area: Rect, data: 
         } else {
             String::new()
         };
-        let padded_label = format!("{:>width$}│", y_label, width = (y_label_width - 1) as usize);
+        let padded_label = format!("{:>width$}|", y_label, width = (y_label_width - 1) as usize);
         for (i, ch) in padded_label.chars().enumerate() {
             let x = area.x + i as u16;
             if x < area.x + y_label_width {
@@ -131,7 +131,7 @@ pub fn render_stacked_bar_chart(frame: &mut Frame, app: &App, area: Rect, data: 
     // X-axis
     let axis_y = area.y + 1 + chart_height as u16;
     if axis_y < area.y + area.height {
-        let zero_label = format!("{:>width$}│", "0", width = (y_label_width - 1) as usize);
+        let zero_label = format!("{:>width$}|", "0", width = (y_label_width - 1) as usize);
         for (i, ch) in zero_label.chars().enumerate() {
             let x = area.x + i as u16;
             if x < area.x + y_label_width {
@@ -140,9 +140,12 @@ pub fn render_stacked_bar_chart(frame: &mut Frame, app: &App, area: Rect, data: 
                     .set_style(Style::default().fg(app.theme.muted));
             }
         }
+        // ASCII `-`, not U+2500 `─`: the box-drawing horizontal is
+        // East-Asian-Ambiguous and doubles the emitted axis width in a CJK
+        // locale, same as the border glyphs in `AMBIENT_STABLE_BORDER_SET`.
         for x in (area.x + y_label_width)..(area.x + area.width) {
             buf[(x, axis_y)]
-                .set_char('─')
+                .set_char('-')
                 .set_style(Style::default().fg(app.theme.muted));
         }
     }

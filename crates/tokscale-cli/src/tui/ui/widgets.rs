@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Cell, ScrollbarState};
+use ratatui::symbols::border::Set as BorderSet;
+use ratatui::widgets::{Cell, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use tokscale_core::sessions::WORKTREE_SEPARATOR;
 use tokscale_core::ClientId;
 use unicode_segmentation::UnicodeSegmentation;
@@ -91,6 +92,24 @@ pub fn format_ms_per_1k(ms_per_1k_tokens: Option<f64>) -> String {
     }
 }
 
+/// Vertical scrollbar drawn only from width-stable glyphs, for the same
+/// reason as [`AMBIENT_STABLE_BORDER_SET`]: ratatui's defaults — `║` track,
+/// `█` thumb, `▲`/`▼` endpoints — are all East-Asian-Ambiguous, and the
+/// scrollbar overlays the frame's outermost right column, exactly where a
+/// glyph that streams two cells wide in a CJK locale wraps into the next row
+/// (or scrolls the screen from the bottom row). The endpoints and thumb are
+/// East-Asian-Neutral (U+25B4/U+25BE/U+25AE) — one cell under both `width`
+/// and `width_cjk`, the same class as the U+22EF truncation marker — and the
+/// track is ASCII. Every scrollbar goes through here so no caller
+/// reintroduces a default symbol.
+pub fn ambient_stable_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("\u{25B4}")) // ▴
+        .end_symbol(Some("\u{25BE}")) // ▾
+        .track_symbol(Some("|"))
+        .thumb_symbol("\u{25AE}") // ▮
+}
+
 pub fn viewport_scrollbar_state(
     content_len: usize,
     scroll_offset: usize,
@@ -133,6 +152,36 @@ pub fn truncate_text(s: &str, max_chars: usize) -> String {
 pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
+
+/// Box-drawing border for every framed block, built entirely from ASCII.
+///
+/// Every code point in ratatui's default sets (PLAIN, ROUNDED, DOUBLE, …) is
+/// East-Asian-Ambiguous: one cell to `unicode-width` — and to ratatui's own
+/// cell math — but two cells in a terminal running a CJK locale. Ratatui's
+/// crossterm backend streams adjacent buffer cells without repositioning
+/// between them, so every ambiguous glyph makes the emitted row one physical
+/// cell wider than the buffer believes; the overflow pushes the rest of the
+/// row past the terminal edge, wrapping onto — or, on the last row, scrolling
+/// — the line below while the diff buffer still thinks nothing moved. `│` `─`
+/// `┌` are exactly the same class of bug as the U+2026 ellipsis fixed in
+/// #1304, just drawn by the frame instead of the content. That includes the
+/// horizontals: a top or bottom edge drawn with `─` emits at roughly twice
+/// the row width, and the footer's bottom border sits on the terminal's last
+/// row where the wrap becomes a scroll. Unicode assigns no unambiguous light
+/// horizontal — the dashes U+2010..U+2015 are all Ambiguous as well — so the
+/// horizontal is ASCII `-` like every other member: one cell in every
+/// terminal, so a frame measures the same in both ambients and the table's
+/// width budget holds.
+pub const AMBIENT_STABLE_BORDER_SET: BorderSet = BorderSet {
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+};
 
 /// Longest prefix of `s` that fits in `max_cells` terminal cells. Never splits
 /// a grapheme, so the result can come in one cell short of the budget rather
@@ -197,7 +246,7 @@ pub fn suffix_to_width(s: &str, max_cells: usize) -> &str {
 /// pushed the rest of the table sideways. U+22EF is Neutral, so it is one cell
 /// in both ambients and the budget this module computes is the width the
 /// terminal actually uses.
-const MIDDLE_ELLIPSIS: &str = "⋯";
+pub(crate) const MIDDLE_ELLIPSIS: &str = "⋯";
 
 /// Fit `s` into `max_cells` by dropping its MIDDLE instead of its tail.
 ///
@@ -516,6 +565,50 @@ pub(crate) fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// [`truncate_ellipsis`] measured in terminal cells instead of code points.
+///
+/// A string holding full-width graphemes is cut against the width ratatui will
+/// actually draw it at. A code-point budget lets `활성 · 한도부족` (9 code
+/// points, 15 cells) through a 14-cell column untouched, and ratatui then clips
+/// it at the panel edge with no marker at all, which is the failure this exists
+/// to prevent.
+///
+/// The marker is [`MIDDLE_ELLIPSIS`], not U+2026 `…`: U+2026 is
+/// East-Asian-Ambiguous and draws two cells in a CJK-locale terminal, which is
+/// exactly where the translated text this helper fits is read. A one-cell
+/// budget has to stay one cell there too.
+pub(crate) fn truncate_ellipsis_to_width(s: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_cells {
+        return s.to_string();
+    }
+    if max_cells == 1 {
+        return MIDDLE_ELLIPSIS.to_string();
+    }
+    format!("{}{MIDDLE_ELLIPSIS}", prefix_to_width(s, max_cells - 1))
+}
+
+/// Pad `s` with trailing spaces until it occupies `cells` terminal cells.
+///
+/// The cell-counting replacement for `format!("{:<cells$}", s)`, which pads by
+/// **code points**: `한도부족` is 4 code points and 8 cells, so `{:<11}` grew it
+/// to 15 cells and every wide row started its next column somewhere else.
+/// Already-too-wide text is returned unchanged — pad, never truncate, so the
+/// caller keeps deciding how a cut is marked.
+pub(crate) fn pad_to_width(s: &str, cells: usize) -> String {
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(cells.saturating_sub(display_width(s))));
+    out
+}
+
+/// Right-aligned twin of [`pad_to_width`], replacing `format!("{:>cells$}", s)`.
+pub(crate) fn pad_start_to_width(s: &str, cells: usize) -> String {
+    let padding = " ".repeat(cells.saturating_sub(display_width(s)));
+    format!("{padding}{s}")
+}
+
 pub fn get_model_color(model: &str) -> Color {
     get_provider_shade(get_provider_from_model(model), 0)
 }
@@ -775,14 +868,16 @@ pub fn get_client_color(client: &str) -> Color {
         "codebuff" => Color::Rgb(124, 58, 237),    // #7C3AED Codebuff brand purple
         "freebuff" => Color::Rgb(56, 189, 248),    // #38BDF8 Freebuff sky blue
         "antigravity" => Color::Rgb(99, 102, 241), // #6366F1 Antigravity indigo
-        "zed" => Color::Rgb(8, 76, 207),           // #084CCF Zed blue
-        "warp" => Color::Rgb(1, 155, 150),         // #019B96 Warp teal
-        "gjc" => Color::Rgb(220, 38, 38),          // #DC2626 gajae-code red-claw
-        "jcode" => Color::Rgb(245, 158, 11),       // #F59E0B Jcode amber
-        "junie" => Color::Rgb(123, 97, 255),       // #7B61FF Junie violet
+        "antigravity-cli" | "antigravity-extension" => Color::Rgb(99, 102, 241),
+        "zed" => Color::Rgb(8, 76, 207),     // #084CCF Zed blue
+        "warp" => Color::Rgb(1, 155, 150),   // #019B96 Warp teal
+        "gjc" => Color::Rgb(220, 38, 38),    // #DC2626 gajae-code red-claw
+        "jcode" => Color::Rgb(245, 158, 11), // #F59E0B Jcode amber
+        "junie" => Color::Rgb(123, 97, 255), // #7B61FF Junie violet
         "prime-agent" => Color::Rgb(108, 99, 255), // #6C63FF Prime violet
-        "unsloth" => Color::Rgb(88, 204, 2),       // #58CC02 Unsloth green
-        _ => Color::Rgb(136, 136, 136),            // #888888
+        "unsloth" => Color::Rgb(88, 204, 2), // #58CC02 Unsloth green
+        "muse" => Color::Rgb(0, 100, 224),   // #0064E0 Muse brand blue
+        _ => Color::Rgb(136, 136, 136),      // #888888
     }
 }
 
@@ -951,6 +1046,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// On pure ASCII the cell version cuts at the same place as the code-point
+    /// version and differs only in its marker: `⋯` instead of the
+    /// East-Asian-Ambiguous `…`, so the marker is one cell in every terminal.
+    #[test]
+    fn truncate_ellipsis_to_width_cuts_ascii_where_the_char_version_does() {
+        for budget in 0..=24 {
+            for s in [
+                "Active · Watch",
+                "Quota Low",
+                "nearest expires 2031-01-01 09:00",
+                "",
+            ] {
+                assert_eq!(
+                    truncate_ellipsis_to_width(s, budget),
+                    truncate_ellipsis(s, budget).replace('…', MIDDLE_ELLIPSIS),
+                    "{s:?} at {budget} cells"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_ellipsis_to_width_never_exceeds_its_budget_and_marks_the_cut() {
+        // 9 code points, 15 cells: the case a `{:>14}` column got wrong.
+        let wide = "활성 · 한도부족";
+        assert_eq!(
+            truncate_ellipsis(wide, 14),
+            wide,
+            "code points say it fits a 14-cell column"
+        );
+        let fitted = truncate_ellipsis_to_width(wide, 14);
+        assert!(display_width(&fitted) <= 14, "{fitted:?}");
+        assert!(
+            fitted.ends_with(MIDDLE_ELLIPSIS),
+            "the cut must be marked: {fitted:?}"
+        );
+
+        for budget in 0..=20 {
+            for s in [wide, "残量わずか · 残量少", "配额不足", "ascii state"] {
+                let out = truncate_ellipsis_to_width(s, budget);
+                assert!(
+                    display_width(&out) <= budget,
+                    "{s:?} overflowed a {budget}-cell budget as {out:?}"
+                );
+                if display_width(s) > budget && budget > 0 {
+                    assert!(
+                        out.ends_with(MIDDLE_ELLIPSIS),
+                        "{s:?} was cut without a marker at {budget}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pad_to_width_pads_in_cells_not_code_points() {
+        // `{:<11}` on this 4-code-point / 8-cell label produced 15 cells.
+        assert_eq!(display_width(&pad_to_width("한도부족", 11)), 11);
+        assert_eq!(display_width(&pad_start_to_width("한도부족", 11)), 11);
+        // ASCII is unchanged relative to `format!`, which is what keeps `en`
+        // byte-identical.
+        assert_eq!(pad_to_width("Watch", 11), format!("{:<11}", "Watch"));
+        assert_eq!(pad_start_to_width("Watch", 11), format!("{:>11}", "Watch"));
+        // Too-wide text is returned untouched, never cut.
+        assert_eq!(pad_to_width("한도부족", 4), "한도부족");
+        assert_eq!(pad_start_to_width("한도부족", 4), "한도부족");
     }
 
     #[test]

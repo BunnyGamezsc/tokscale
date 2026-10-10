@@ -35,6 +35,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "commandcode",
   "micode",
   "antigravity-cli",
+  "antigravity-extension",
   "junie",
   "zcode",
   "opencodereview",
@@ -54,6 +55,8 @@ export const SUPPORTED_CLIENT_TYPES = [
   "lmstudio",
   "unsloth",
   "hindsight",
+  "micode-desktop",
+  "muse",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

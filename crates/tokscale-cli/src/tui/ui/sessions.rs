@@ -1,16 +1,16 @@
 use chrono::{Local, NaiveDateTime, TimeZone};
 use ratatui::prelude::*;
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use super::widgets::{
-    display_width, format_cache_hit_rate, format_cost, format_cost_per_million, format_tokens,
-    get_compact_client_display_name, prefix_to_width, total_tokens_cell, truncate_text,
-    truncate_to_width, viewport_scrollbar_state,
+    ambient_stable_scrollbar, display_width, format_cache_hit_rate, format_cost,
+    format_cost_per_million, format_tokens, get_compact_client_display_name, prefix_to_width,
+    total_tokens_cell, truncate_text, truncate_to_width, viewport_scrollbar_state,
+    AMBIENT_STABLE_BORDER_SET, MIDDLE_ELLIPSIS,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use crate::tui::data::{SessionModel, SessionUsage};
+use crate::tui::i18n::{tr, MessageKey, TuiLanguage};
 
 /// Widest the Model column ever grows; surplus past this goes to Session.
 const MODEL_COLUMN_MAX_CHARS: u16 = 36;
@@ -156,23 +156,28 @@ struct WideLayout {
 }
 
 impl SessionColumn {
-    fn header(self) -> &'static str {
+    fn header(self, lang: TuiLanguage) -> &'static str {
         match self {
-            Self::Session => "Session",
-            Self::Client => "Client",
-            Self::Model => "Model",
-            Self::Turn => "Turn",
-            Self::Msgs => "Msgs",
-            Self::Input => "Input",
-            Self::Output => "Output",
-            Self::CacheRead => "Cache R",
-            Self::CacheWrite => "Cache W",
-            Self::CacheHit => "Cache×",
-            Self::Total => "Total",
-            Self::Cost => "Cost",
-            Self::CostPerMillion => "Cost/1M",
-            Self::Duration => "Duration",
-            Self::LastActive => "Last Active",
+            Self::Session => tr(lang, MessageKey::ColSession),
+            Self::Client => tr(lang, MessageKey::ColClient),
+            Self::Model => tr(lang, MessageKey::ColModel),
+            Self::Turn => tr(lang, MessageKey::ColTurn),
+            // The short label, because this column's budget is 5 cells with
+            // turn data and the full `ColMessages` label is 6 in Korean —
+            // ratatui clipped `메시지` to `메시`, a truncated word with no
+            // ellipsis. `header_labels_fit_their_budget_in_every_language`
+            // pins the rest.
+            Self::Msgs => tr(lang, MessageKey::ColMessagesShort),
+            Self::Input => tr(lang, MessageKey::ColInput),
+            Self::Output => tr(lang, MessageKey::ColOutput),
+            Self::CacheRead => tr(lang, MessageKey::ColCacheRead),
+            Self::CacheWrite => tr(lang, MessageKey::ColCacheWrite),
+            Self::CacheHit => tr(lang, MessageKey::ColCacheHit),
+            Self::Total => tr(lang, MessageKey::ColTotal),
+            Self::Cost => tr(lang, MessageKey::ColCost),
+            Self::CostPerMillion => tr(lang, MessageKey::ColCostPer1M),
+            Self::Duration => tr(lang, MessageKey::ColDuration),
+            Self::LastActive => tr(lang, MessageKey::ColLastActive),
         }
     }
 
@@ -291,9 +296,11 @@ impl SessionColumn {
         layout: &WideLayout,
     ) -> Cell<'static> {
         match self {
-            Self::Session => Cell::from(truncate_to_width(
-                session_label(s),
+            Self::Session => Cell::from(label_with_rollup_marker(
+                s,
+                app,
                 layout.session_width as usize,
+                truncate_to_width,
             ))
             .style(
                 Style::default()
@@ -324,7 +331,7 @@ impl SessionColumn {
                 format_cache_hit_rate(s.tokens.cache_read, s.tokens.input, s.tokens.cache_write),
                 ctx,
             ))
-            .style(Style::default().fg(Color::Cyan)),
+            .style(app.theme.count_style()),
             // Spelled out rather than `total_tokens_cell` — same style, but the
             // helper has no width to clamp against.
             Self::Total => Cell::from(self.fit(format_tokens(s.tokens.total()), ctx))
@@ -337,7 +344,7 @@ impl SessionColumn {
             }
             Self::Duration => {
                 Cell::from(self.fit(format_duration(s.first_active_ms, s.last_active_ms), ctx))
-                    .style(Style::default().fg(Color::Yellow))
+                    .style(app.theme.hint_key_style())
             }
             Self::LastActive => Cell::from(
                 self.fit(
@@ -442,7 +449,7 @@ fn admit_and_distribute(available: u16, ctx: &WideCtx) -> WideLayout {
         } else {
             // Stop, don't skip. Trying the next (narrower) group packs more
             // columns in but makes the admitted set non-monotonic in width —
-            // Cache× at W, Duration and no Cache× at W+1 — which is the same
+            // Cache✕ at W, Duration and no Cache✕ at W+1 — which is the same
             // disorientation the ratatui solver produces today.
             break;
         }
@@ -471,6 +478,81 @@ fn admit_and_distribute(available: u16, ctx: &WideCtx) -> WideLayout {
     }
 }
 
+/// The narrow and very-narrow layouts' header labels, in display order.
+///
+/// A function rather than an inline `vec!` so the budget test asserts against
+/// the labels the renderer actually writes. A test that restates the label set
+/// passes while the renderer uses a different one — which is how the Korean
+/// `클라이언트` clip survived a header test that had already been written.
+///
+/// These layouts are percentage-width, so no `natural()` budget exists to check
+/// arithmetically: `rendered_headers_survive_every_language_at_every_width` has
+/// to read the drawn row. The short `Client` label is what makes the CJK
+/// translations fit the roughly 9 cells the percentages grant at 60–80 columns.
+fn narrow_header_labels(
+    lang: TuiLanguage,
+    is_very_narrow: bool,
+    has_turn_data: bool,
+) -> Vec<&'static str> {
+    if is_very_narrow {
+        return vec![
+            tr(lang, MessageKey::ColSession),
+            tr(lang, MessageKey::ColCost),
+        ];
+    }
+
+    let mut labels = vec![
+        tr(lang, MessageKey::ColSession),
+        tr(lang, MessageKey::ColClientShort),
+    ];
+    if has_turn_data {
+        labels.push(tr(lang, MessageKey::ColTurn));
+    }
+    labels.extend([
+        tr(lang, MessageKey::ColMessages),
+        // The Tokens column gets ~9 cells here and carries the sort arrow, so
+        // it needs a label that fits with ` ▾` (ja `トークン ▾` is 10 cells).
+        tr(lang, MessageKey::ColTokensShort),
+        tr(lang, MessageKey::ColCost),
+    ]);
+    labels
+}
+
+/// Header cells for the narrow layouts: [`narrow_header_labels`] plus the sort
+/// arrow on the Tokens or Cost column. Shared by the renderer and its tests so
+/// the arrow a test expects is the arrow the renderer draws.
+fn narrow_header_cells(
+    lang: TuiLanguage,
+    is_very_narrow: bool,
+    has_turn_data: bool,
+    sort_indicator: impl Fn(SortField) -> &'static str,
+) -> Vec<String> {
+    let labels = narrow_header_labels(lang, is_very_narrow, has_turn_data);
+    // The narrow layouts keep their hand-picked indices, and `usize::MAX`
+    // still stands for "this sort has no column here".
+    let (total_idx, cost_idx) = if is_very_narrow {
+        (usize::MAX, 1)
+    } else if has_turn_data {
+        (4, 5)
+    } else {
+        (3, 4)
+    };
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let indicator = if i == total_idx {
+                sort_indicator(SortField::Tokens)
+            } else if i == cost_idx {
+                sort_indicator(SortField::Cost)
+            } else {
+                ""
+            };
+            format!("{}{}", h, indicator)
+        })
+        .collect()
+}
+
 /// The human-readable title when the source client stored one, falling back to
 /// the session ID for clients that don't.
 fn session_label(s: &SessionUsage) -> &str {
@@ -479,13 +561,35 @@ fn session_label(s: &SessionUsage) -> &str {
         .filter(|t| !t.is_empty())
         .unwrap_or(&s.session_id)
 }
+/// Session label with the roll-up marker for a parent row that absorbed
+/// subagent sessions. The marker is a PREFIX, never a suffix: table cells
+/// clip at the tail, so a trailing "(+N)" would be cut off long titles at
+/// narrow widths. Its width is reserved before the title is truncated, using
+/// the caller's truncator (`truncate_to_width` on the wide path,
+/// `truncate_text` on the narrow ones); the marker itself is plain ASCII, so
+/// code points and display cells agree for it either way.
+fn label_with_rollup_marker(
+    s: &SessionUsage,
+    app: &App,
+    budget: usize,
+    truncate: fn(&str, usize) -> String,
+) -> String {
+    if !app.roll_up_subagents || s.subagent_count == 0 {
+        return truncate(session_label(s), budget);
+    }
+    let marker = format!("(+{}) ", s.subagent_count);
+    let keep = budget.saturating_sub(marker.chars().count());
+    format!("{}{}", marker, truncate(session_label(s), keep))
+}
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    let lang = app.settings.tui_language;
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_set(AMBIENT_STABLE_BORDER_SET)
         .border_style(Style::default().fg(app.theme.border))
         .title(Span::styled(
-            " Sessions ",
+            format!(" {} ", tr(lang, MessageKey::TabSessions)),
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -500,7 +604,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let sessions = app.get_sorted_sessions();
     if sessions.is_empty() {
-        let empty_msg = Paragraph::new("No session usage data found. Press 'r' to refresh.")
+        let empty_msg = Paragraph::new(tr(lang, MessageKey::EmptyNoSessionData))
             .style(Style::default().fg(app.theme.muted))
             .alignment(Alignment::Center);
         frame.render_widget(empty_msg, inner);
@@ -552,8 +656,8 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_indicator = |field: SortField| -> &'static str {
         if sort_field == field {
             match sort_direction {
-                SortDirection::Ascending => " ▲",
-                SortDirection::Descending => " ▼",
+                SortDirection::Ascending => " ▴",
+                SortDirection::Descending => " ▾",
             }
         } else {
             ""
@@ -571,40 +675,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .map(|c| {
                 let indicator = c.sort_field().map(sort_indicator).unwrap_or("");
-                format!("{}{}", c.header(), indicator)
+                format!("{}{}", c.header(lang), indicator)
             })
             .collect()
     } else {
-        let labels: &[&str] = if is_very_narrow {
-            &["Session", "Cost"]
-        } else if has_turn_data {
-            &["Session", "Client", "Turn", "Msgs", "Tokens", "Cost"]
-        } else {
-            &["Session", "Client", "Msgs", "Tokens", "Cost"]
-        };
-        // The narrow layouts keep their hand-picked indices, and `usize::MAX`
-        // still stands for "this sort has no column here".
-        let (total_idx, cost_idx) = if is_very_narrow {
-            (usize::MAX, 1)
-        } else if has_turn_data {
-            (4, 5)
-        } else {
-            (3, 4)
-        };
-        labels
-            .iter()
-            .enumerate()
-            .map(|(i, h)| {
-                let indicator = if i == total_idx {
-                    sort_indicator(SortField::Tokens)
-                } else if i == cost_idx {
-                    sort_indicator(SortField::Cost)
-                } else {
-                    ""
-                };
-                format!("{}{}", h, indicator)
-            })
-            .collect()
+        narrow_header_cells(lang, is_very_narrow, has_turn_data, sort_indicator)
     };
 
     let header = Row::new(header_cells.into_iter().map(Cell::from).collect::<Vec<_>>())
@@ -639,7 +714,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     .collect()
             } else if is_very_narrow {
                 vec![
-                    Cell::from(truncate_text(session_label(session), 20)).style(
+                    Cell::from(label_with_rollup_marker(session, app, 20, truncate_text)).style(
                         Style::default()
                             .fg(theme_muted)
                             .add_modifier(Modifier::BOLD),
@@ -647,11 +722,15 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format_cost(session.cost)).style(Style::default().fg(Color::Green)),
                 ]
             } else {
-                let mut cells = vec![Cell::from(truncate_text(session_label(session), 24)).style(
-                    Style::default()
-                        .fg(theme_muted)
-                        .add_modifier(Modifier::BOLD),
-                )];
+                let mut cells =
+                    vec![
+                        Cell::from(label_with_rollup_marker(session, app, 24, truncate_text))
+                            .style(
+                                Style::default()
+                                    .fg(theme_muted)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                    ];
                 cells.push(
                     Cell::from(get_compact_client_display_name(&session.client))
                         .style(Style::default().fg(theme_muted)),
@@ -718,9 +797,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(table, inner);
 
     if sessions_len > visible_height {
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
+        let scrollbar = ambient_stable_scrollbar();
 
         let mut scrollbar_state =
             viewport_scrollbar_state(sessions_len, scroll_offset, visible_height);
@@ -746,6 +823,9 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 /// A multi-model session always ends in an ellipsis when some of its models did
 /// not fit, so a session that switched models never renders as a single-model
 /// one. One cell is held back for that marker when there is more than one model.
+/// The marker is [`MIDDLE_ELLIPSIS`], which is one cell in every terminal
+/// locale; U+2026 is East-Asian-Ambiguous and would be two cells under a CJK
+/// locale, overflowing the budget this cell promises to keep.
 fn build_model_cell(models: &[SessionModel], max_cells: usize, app: &App) -> Cell<'static> {
     if models.is_empty() {
         return Cell::from("\u{2014}".to_string()).style(Style::default().fg(app.theme.muted));
@@ -777,13 +857,13 @@ fn build_model_cell(models: &[SessionModel], max_cells: usize, app: &App) -> Cel
             spans.push(Span::styled(name.clone(), Style::default().fg(color)));
             budget -= model_len;
         } else if budget <= 1 {
-            spans.push(Span::styled("…".to_string(), Style::default().fg(color)));
+            spans.push(Span::styled(MIDDLE_ELLIPSIS, Style::default().fg(color)));
             budget = 0;
             ellipsis = true;
         } else {
             let head = prefix_to_width(name, budget - 1);
             spans.push(Span::styled(
-                format!("{}…", head),
+                format!("{head}{MIDDLE_ELLIPSIS}"),
                 Style::default().fg(color),
             ));
             budget = 0;
@@ -796,7 +876,7 @@ fn build_model_cell(models: &[SessionModel], max_cells: usize, app: &App) -> Cel
     // name already carries its own ellipsis, so only mark the clean-break case.
     if shown < models.len() && !ellipsis {
         spans.push(Span::styled(
-            "…".to_string(),
+            MIDDLE_ELLIPSIS,
             Style::default().fg(app.theme.muted),
         ));
     }
@@ -845,8 +925,10 @@ mod tests {
     use super::*;
     use crate::tui::app::{Tab, TuiConfig};
     use crate::tui::data::TokenBreakdown;
+    use crate::tui::ui::header_budget::{assert_header_fits, assert_headers_render_in_full};
     use ratatui::{backend::TestBackend, Terminal};
     use tokscale_core::ClientId;
+    use unicode_width::UnicodeWidthStr;
 
     /// Terminal width at which each priority group first appears.
     ///
@@ -932,7 +1014,8 @@ mod tests {
     /// substring of `Cost/1M`, so the longer label is stripped before looking for
     /// the shorter one; no other pair of labels overlaps.
     fn header_columns(header: &str) -> Vec<SessionColumn> {
-        let without_cost_per_million = header.replace(SessionColumn::CostPerMillion.header(), "");
+        let without_cost_per_million =
+            header.replace(SessionColumn::CostPerMillion.header(TuiLanguage::En), "");
         ALL.iter()
             .copied()
             .filter(|c| {
@@ -941,7 +1024,7 @@ mod tests {
                 } else {
                     header
                 };
-                haystack.contains(c.header())
+                haystack.contains(c.header(TuiLanguage::En))
             })
             .collect()
     }
@@ -975,6 +1058,7 @@ mod tests {
             turn_count: 2,
             first_active_ms: last_ms.saturating_sub(3_600_000),
             last_active_ms: last_ms,
+            subagent_count: 0,
         }
     }
 
@@ -1043,6 +1127,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::new_with_cached_data(config, None).unwrap();
+        app.settings.tui_language = TuiLanguage::En;
         app.terminal_width = width;
         app.current_tab = Tab::Sessions;
         app.sort_field = SortField::Cost;
@@ -1169,7 +1254,7 @@ mod tests {
                     let header = header_line(&mut app, width);
                     for column in *group {
                         assert_eq!(
-                            header.contains(column.header()),
+                            header.contains(column.header(TuiLanguage::En)),
                             want,
                             "{:?} at width {width} (turn={has_turn}) should be {}\n{header}",
                             column,
@@ -1272,7 +1357,7 @@ mod tests {
                 let row = lines.next().unwrap_or_default();
                 for column in expected_columns(width, has_turn) {
                     assert!(
-                        header.contains(column.header()),
+                        header.contains(column.header(TuiLanguage::En)),
                         "header {:?} squeezed at width {width} (turn={has_turn})\n{header}",
                         column
                     );
@@ -1313,7 +1398,7 @@ mod tests {
                         continue;
                     }
                     assert!(
-                        !header.contains(column.header()),
+                        !header.contains(column.header(TuiLanguage::En)),
                         "{:?} header showed at width {width} (turn={has_turn})\n{header}",
                         column
                     );
@@ -1327,8 +1412,112 @@ mod tests {
         }
     }
 
+    /// Every column's header fits its own budget in every language, arrow
+    /// included. #1367 translated the labels without re-checking the budgets
+    /// the layout was solved against, and Korean `ColMessages` (`메시지`, 6
+    /// cells) landed in `Msgs`'s 5-cell budget: ratatui clipped it to `메시`,
+    /// a truncated word with no ellipsis — the exact failure this module's doc
+    /// comment says it exists to prevent. English was unaffected (`Msgs` is 4
+    /// cells) and every other test here pins `TuiLanguage::En`, so nothing
+    /// caught it.
+    ///
+    /// Arithmetic against `natural()` rather than a rendered frame, so a new
+    /// translation fails at authoring time with the overflow named in cells
+    /// instead of only at whichever width admits the column.
+    #[test]
+    fn header_labels_fit_their_budget_in_every_language() {
+        for lang in TuiLanguage::ALL {
+            for has_turn in [true, false] {
+                let ctx = wide_ctx(has_turn);
+                for column in ALL {
+                    if !column.available(&ctx) {
+                        continue;
+                    }
+                    assert_header_fits(
+                        &format!("sessions/wide(turn={has_turn})"),
+                        &format!("{column:?}"),
+                        lang,
+                        column.header(lang),
+                        column.natural(&ctx),
+                        column.sort_field().is_some(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same claim through the renderer, in every language and across the
+    /// whole width sweep. `natural()` is the *declared* budget; this is the one
+    /// ratatui actually hands out, so the two together catch both a too-long
+    /// translation and a layout that stops honouring its own budget.
+    ///
+    /// Narrow and very-narrow widths are included, which the arithmetic test
+    /// cannot cover: those layouts are percentage-based and have no `natural()`.
+    #[test]
+    fn rendered_headers_survive_every_language_at_every_width() {
+        for lang in TuiLanguage::ALL {
+            for width in 40u16..=SWEEP_MAX {
+                for has_turn in [true, false] {
+                    // Every sortable field in both directions, so a header
+                    // whose sort arrow clips fails even when its label fits.
+                    for (field, direction) in [
+                        (SortField::Cost, SortDirection::Descending),
+                        (SortField::Cost, SortDirection::Ascending),
+                        (SortField::Tokens, SortDirection::Descending),
+                        (SortField::Tokens, SortDirection::Ascending),
+                        (SortField::Date, SortDirection::Descending),
+                        (SortField::Date, SortDirection::Ascending),
+                    ] {
+                        let mut s = fat_session();
+                        if !has_turn {
+                            s.turn_count = 0;
+                        }
+                        let mut app = app_with(width, vec![s]);
+                        app.settings.tui_language = lang;
+                        app.sort_field = field;
+                        app.sort_direction = direction;
+                        let header = header_line(&mut app, width);
+                        let ctx = wide_ctx(has_turn);
+                        let arrow = |f: SortField| -> &'static str {
+                            match (f == field, direction) {
+                                (false, _) => "",
+                                (true, SortDirection::Ascending) => " ▴",
+                                (true, SortDirection::Descending) => " ▾",
+                            }
+                        };
+                        // Asked of the renderer's own helpers, never restated
+                        // here: a test that keeps its own copy of the label set
+                        // passes while the renderer uses a different one.
+                        let cells: Vec<String> = if width >= 80 {
+                            admit_and_distribute(width - 2, &ctx)
+                                .chosen
+                                .iter()
+                                .map(|c| {
+                                    let indicator = c.sort_field().map(arrow).unwrap_or("");
+                                    format!("{}{}", c.header(lang), indicator)
+                                })
+                                .collect()
+                        } else {
+                            narrow_header_cells(lang, width < 60, has_turn, arrow)
+                        };
+                        let labels: Vec<&str> = cells.iter().map(String::as_str).collect();
+
+                        assert_headers_render_in_full(
+                            &format!(
+                                "sessions(width={width},turn={has_turn},sort={field:?} {direction:?})"
+                            ),
+                            lang,
+                            &header,
+                            &labels,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The active sort arrow is legible whenever its column is admitted, and
-    /// absent from the whole header when it is not. Today `Last Active ▼` is
+    /// absent from the whole header when it is not. Today `Last Active ▾` is
     /// missing at 77 of 121 widths.
     ///
     /// Both directions, because `make_app` fixes the sort to descending and an
@@ -1341,8 +1530,8 @@ mod tests {
         for width in 80u16..=SWEEP_MAX {
             for has_turn in [true, false] {
                 for (direction, arrow) in [
-                    (SortDirection::Descending, '▼'),
-                    (SortDirection::Ascending, '▲'),
+                    (SortDirection::Descending, '▾'),
+                    (SortDirection::Ascending, '▴'),
                 ] {
                     for (field, column) in [
                         (SortField::Cost, SessionColumn::Cost),
@@ -1359,7 +1548,10 @@ mod tests {
                         let header = header_line(&mut app, width);
                         if expected_columns(width, has_turn).contains(&column) {
                             assert!(
-                                header.contains(&format!("{} {arrow}", column.header())),
+                                header.contains(&format!(
+                                    "{} {arrow}",
+                                    column.header(TuiLanguage::En)
+                                )),
                                 "{:?} {arrow} clipped at width {width} (turn={has_turn})\n{header}",
                                 field
                             );
@@ -1373,7 +1565,7 @@ mod tests {
                         }
                         // The other glyph must never appear at all — one active
                         // sort, one arrow.
-                        let other = if arrow == '▼' { '▲' } else { '▼' };
+                        let other = if arrow == '▾' { '▴' } else { '▾' };
                         assert!(
                             !header.contains(other),
                             "both arrows drawn at width {width} (turn={has_turn})\n{header}"
@@ -1386,7 +1578,7 @@ mod tests {
 
     /// Widening the terminal never removes a column. `break` in the admission
     /// loop is what buys this: skipping a group that does not fit and trying the
-    /// next, narrower one would show Cache× at W and Duration instead at W+1.
+    /// next, narrower one would show Cache✕ at W and Duration instead at W+1.
     ///
     /// Note what this does **not** cover: it compares header *sets*, so it stays
     /// green through the Session sawtooth (Session is 40 cells at 149 and 20 at
@@ -1517,6 +1709,7 @@ mod tests {
         let width = 200;
         for (a, b) in [
             ("antigravity-cli", "antigravity"),
+            ("antigravity-extension", "antigravity"),
             ("opencodereview", "opencode"),
             ("devin-desktop", "devin"),
             ("openclaw", "opencode"),
@@ -1630,7 +1823,7 @@ mod tests {
     /// `build_model_cell` measures in cells for the same reason the Session and
     /// Client cells do, and needs its own fixture because every other model in
     /// this file is ASCII. On a code-point budget a full-width name fills 17
-    /// graphemes of an 18-cell column, and the "…" it appends is the first
+    /// graphemes of an 18-cell column, and the "⋯" it appends is the first
     /// thing the solver cuts — a truncated name that does not look truncated.
     #[test]
     fn a_full_width_model_name_is_budgeted_in_cells_not_code_points() {
@@ -1659,7 +1852,7 @@ mod tests {
                     layout.model_width
                 );
                 assert!(
-                    row.contains('…'),
+                    row.contains('⋯'),
                     "an over-long full-width model name must be marked as truncated at width \
                      {width} (turn={has_turn})\n{row}"
                 );
@@ -1704,43 +1897,43 @@ mod tests {
                 59u16,
                 true,
                 SortField::Cost,
-                "│Session                           Cost ▼                 │",
-                "│A fairly long ses...              $12.35                 │",
+                "|Session                           Cost ▾                 |",
+                "|A fairly long ses...              $12.35                 |",
             ),
             (
                 59,
                 true,
                 SortField::Date,
-                "│Session                           Cost                   │",
-                "│A fairly long ses...              $12.35                 │",
+                "|Session                           Cost                   |",
+                "|A fairly long ses...              $12.35                 |",
             ),
             (
                 60,
                 true,
                 SortField::Cost,
-                "│Session     Client     Turn   Msgs    Tokens     Cost ▼   │",
-                "│A fairly lo OpenCode   137    428     49.5M      $12.35   │",
+                "|Session     Client     Turn   Msgs    Tokens     Cost ▾   |",
+                "|A fairly lo OpenCode   137    428     49.5M      $12.35   |",
             ),
             (
                 60,
                 false,
                 SortField::Tokens,
-                "│Session         Client     Msgs    Tokens ▼   Cost        │",
-                "│A fairly long s OpenCode   428     49.5M      $12.35      │",
+                "|Session         Client     Msgs    Tokens ▾   Cost        |",
+                "|A fairly long s OpenCode   428     49.5M      $12.35      |",
             ),
             (
                 79,
                 true,
                 SortField::Tokens,
-                "│Session           Client       Turn      Msgs      Tokens ▼      Cost        │",
-                "│A fairly long ses OpenCode     137       428       49.5M         $12.35      │",
+                "|Session           Client       Turn      Msgs      Tokens ▾      Cost        |",
+                "|A fairly long ses OpenCode     137       428       49.5M         $12.35      |",
             ),
             (
                 79,
                 false,
                 SortField::Date,
-                "│Session               Client         Msgs      Tokens         Cost           │",
-                "│A fairly long session OpenCode       428       49.5M          $12.35         │",
+                "|Session               Client         Msgs      Tokens         Cost           |",
+                "|A fairly long session OpenCode       428       49.5M          $12.35         |",
             ),
         ] {
             let mut s = fat_session();
@@ -1784,7 +1977,7 @@ mod tests {
                     "Output",
                     "Cache R",
                     "Cache W",
-                    "Cache×",
+                    "Cache✕",
                     "Total",
                     "Cost/1M",
                     "Duration",
@@ -1836,6 +2029,54 @@ mod tests {
         assert!(
             body.contains("Last Active"),
             "expected last active header\n{body}"
+        );
+    }
+
+    #[test]
+    fn rolled_parent_shows_subagent_count_marker() {
+        let mut app = make_app(200);
+        app.roll_up_subagents = true;
+        let mut s = session("parent-1", "pi", 2.5, 1_736_000_000_000);
+        s.title = Some("Parent session".to_string());
+        s.subagent_count = 3;
+        app.data.sessions_rolled = vec![s];
+        let body = render_body(&mut app, 200, 12);
+        assert!(
+            body.contains("(+3) Parent session"),
+            "expected roll-up marker in body\n{body}"
+        );
+    }
+
+    #[test]
+    fn rolled_marker_survives_truncation() {
+        // A long parent title must not push the "(+N)" marker out of the
+        // truncated label: the marker reserves its width first.
+        for width in [70, 200] {
+            let mut app = make_app(width);
+            app.roll_up_subagents = true;
+            let mut s = session("parent-1", "pi", 2.5, 1_736_000_000_000);
+            s.title = Some("Commit test improvements and codebase audit".to_string());
+            s.subagent_count = 19;
+            app.data.sessions_rolled = vec![s];
+            let body = render_body(&mut app, width, 12);
+            assert!(
+                body.contains("(+19)"),
+                "marker must survive truncation at width {width}\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_view_hides_subagent_count_marker() {
+        let mut app = make_app(200);
+        let mut s = session("parent-1", "pi", 2.5, 1_736_000_000_000);
+        s.title = Some("Parent session".to_string());
+        s.subagent_count = 3; // would only be set in the rolled view
+        app.data.sessions = vec![s];
+        let body = render_body(&mut app, 200, 12);
+        assert!(
+            !body.contains("(+3)"),
+            "flat view must not show the roll-up marker\n{body}"
         );
     }
 
@@ -1922,7 +2163,7 @@ mod tests {
         let body = render_body(&mut app, 70, 12);
         assert!(body.contains("abc-123"), "expected session id\n{body}");
         assert!(
-            !body.contains("Cache×"),
+            !body.contains("Cache✕"),
             "cache hit rate should be dropped in narrow mode\n{body}"
         );
     }
@@ -1949,7 +2190,7 @@ mod tests {
             app.sort_field = SortField::Tokens;
             let header = header_line(&mut app, 200);
             assert!(
-                header.contains("Total ▼"),
+                header.contains("Total ▾"),
                 "tokens sort indicator misplaced (turn={has_turn})\n{header}"
             );
 
@@ -1957,7 +2198,7 @@ mod tests {
             app.sort_field = SortField::Date;
             let header = header_line(&mut app, 200);
             assert!(
-                header.contains("Last Active ▼"),
+                header.contains("Last Active ▾"),
                 "date sort indicator misplaced (turn={has_turn})\n{header}"
             );
         }
@@ -1970,8 +2211,60 @@ mod tests {
     /// the Model-first rule put it. Pinned by `slack_goes_to_the_session_title_*`.
     const MODEL_WIDTH_22_TERMINAL: u16 = 202;
 
+    /// `unicode-width` resolves East-Asian-Ambiguous characters to one cell by
+    /// default and to two under `width_cjk`, which is what a terminal in a CJK
+    /// locale does. Ratatui's crossterm backend streams adjacent cells without
+    /// repositioning between them, so any row whose glyphs measure wider under
+    /// `width_cjk` than under `width` overflows the terminal edge when drawn.
+    /// Every row of the rendered frame is asserted whole — borders, corners,
+    /// header, scrollbar column and all, nothing trimmed — so the top and
+    /// bottom edges, the sort indicator, an active scrollbar, and the cell
+    /// contents (truncation marker included: U+2026 fails this, U+22EF passes)
+    /// are all held to the same invariant: the frame measures identically in
+    /// both ambients.
+    fn assert_frame_measures_the_same_in_a_cjk_locale(app: &mut App, width: u16, height: u16) {
+        let frame = render_body(app, width, height);
+        for row in frame.lines() {
+            assert_eq!(
+                UnicodeWidthStr::width_cjk(row),
+                display_width(row),
+                "every row must measure the same in a CJK locale\n{row:?}\n{frame}"
+            );
+        }
+    }
+
+    /// The frame stays width-stable while scrolled: with more sessions than
+    /// fit, the scrollbar overlays the outermost right column — endpoints on
+    /// the first and last inner rows, thumb and track between — which is
+    /// exactly where a glyph that streams two cells wide in a CJK locale
+    /// wraps into the next row, or scrolls the screen when it lands near the
+    /// bottom. A CJK session title exercises the content path too: W-class
+    /// glyphs are two cells in both ambients, so they keep the equality.
+    #[test]
+    fn scrolled_frame_measures_the_same_in_a_cjk_locale() {
+        let width = MODEL_WIDTH_22_TERMINAL;
+        let sessions: Vec<SessionUsage> = (0..30)
+            .map(|i| {
+                let mut s = session(
+                    &format!("session-{i}"),
+                    "opencode",
+                    i as f64,
+                    1_736_000_000_000 + i as i64 * 60_000,
+                );
+                if i == 29 {
+                    // Sorted by cost descending, so the CJK title is on the
+                    // first visible row.
+                    s.title = Some("한국어 세션 제목".to_string());
+                }
+                s
+            })
+            .collect();
+        let mut app = app_with(width, sessions);
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 8);
+    }
+
     /// A session that switched models must never render as a single-model
-    /// session. When the next name cannot fit, a trailing "…" marks that models
+    /// session. When the next name cannot fit, a trailing "⋯" marks that models
     /// were dropped instead of them vanishing silently.
     #[test]
     fn multi_model_cell_marks_models_that_did_not_fit() {
@@ -1993,9 +2286,10 @@ mod tests {
         let mut app = app_with(width, vec![s]);
         let body = render_body(&mut app, width, 12);
         assert!(
-            body.contains("gemini-2-5-flash-lite…"),
+            body.contains("gemini-2-5-flash-lite⋯"),
             "expected a truncation marker after the model that did fit\n{body}"
         );
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 12);
         assert!(
             !body.contains("claude"),
             "second model was not supposed to fit at width {width}\n{body}"
@@ -2017,13 +2311,14 @@ mod tests {
         let mut app = app_with(width, vec![s]);
         let body = render_body(&mut app, width, 12);
         assert!(
-            body.contains("a-very-long-model-nam…"),
+            body.contains("a-very-long-model-nam⋯"),
             "expected a single trailing ellipsis on the truncated name\n{body}"
         );
         assert!(
-            !body.contains("……"),
+            !body.contains("⋯⋯"),
             "truncated name must not pick up a second ellipsis\n{body}"
         );
+        assert_frame_measures_the_same_in_a_cjk_locale(&mut app, width, 12);
     }
 
     #[test]

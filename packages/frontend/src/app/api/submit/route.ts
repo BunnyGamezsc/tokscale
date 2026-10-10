@@ -19,6 +19,7 @@ import {
   tagBreakdownCostCompleteness,
   applyCostCompleteness,
   replaceLayoutCostFloors,
+  reapplyReplaceFamilyCostFloor,
   reapplyReplaceLayoutCostFloors,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
@@ -42,6 +43,11 @@ import {
   type DeviceParserStates,
   type ParserHighWaterPlan,
 } from "@/lib/db/parserHighWater";
+import { MICODE_FAMILY, planMiCodeTransition } from "@/lib/db/micodeTransition";
+import {
+  ANTIGRAVITY_FAMILY,
+  planAntigravityTransition,
+} from "@/lib/db/antigravityTransition";
 import { SOURCE_DISPLAY_NAMES } from "@/lib/constants";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 import { getLeaderboardData } from "@/lib/leaderboard/getLeaderboard";
@@ -86,6 +92,28 @@ function isReplacePlan(plan: ParserHighWaterPlan): boolean {
   return plan.mode === "replace";
 }
 
+/**
+ * The family's credited lifetime cost across stored days, read from DB rows
+ * (never incoming or legacy-ledger estimates) before any rewrite can delete
+ * the source that carries it. Feeds `reapplyReplaceFamilyCostFloor`.
+ */
+function quantizeFamilyFloor(
+  existingDays: Array<{ sourceBreakdown: unknown }>,
+  family: readonly string[]
+): number {
+  let cost = 0;
+  for (const day of existingDays) {
+    const breakdown = day.sourceBreakdown as Record<
+      string,
+      ClientBreakdownData
+    > | null;
+    for (const client of family) {
+      cost += ownValue(breakdown ?? {}, client)?.cost ?? 0;
+    }
+  }
+  return cost;
+}
+
 function applyReplaceLayouts(
   merged: Record<string, ClientBreakdownData>,
   date: string,
@@ -96,9 +124,13 @@ function applyReplaceLayouts(
     if (!isReplacePlan(plan) || !plan.layoutDays) continue;
     const next = ownValue(plan.layoutDays, date);
     if (next) {
+      // A replacement is the authoritative token/model layout. Old same-day
+      // models may now belong to another date, so carrying their fields or
+      // cost floors forward would count them twice. Restore any incomplete
+      // cost deficit once across the client's lifetime after all cells exist.
       merged[client] = applyCostCompleteness(
         next,
-        ownValue(merged, client),
+        undefined,
         incomingCostIsComplete
       );
     } else {
@@ -778,19 +810,15 @@ export async function POST(request: Request) {
       }
 
       const deviceParserStates = (submittedDevice.parserStates ?? {}) as DeviceParserStates;
-      // Every client whose parser can re-attribute already-submitted history
-      // runs through the high-water path, not just Copilot. A re-attribution
-      // moves a day's tokens without changing the lifetime total, and the
-      // per-day merge guard defends each stored day against a decrease, so the
-      // days that fall are pinned while the days that rise are written: the
-      // device's stored total inflates by exactly what moved. Bounding each
-      // submission by the device/client lifetime high-water makes a pure
-      // reshuffle contribute nothing, which is the only reading of it that is
-      // both non-destructive and non-inflating.
+      // Clients whose parsers can re-attribute prior history use high-water
+      // plans. Antigravity and MiMo are handled below as atomic source families
+      // because their presentation surfaces can overlap; the remaining
+      // clients use independent device/client ledgers.
       const parserPlans = new Map<string, ParserHighWaterPlan>();
       for (const [client, supportedVersion] of Object.entries(
         SUPPORTED_VERSIONED_PARSERS
       )) {
+        if ((ANTIGRAVITY_FAMILY as readonly string[]).includes(client)) continue;
         const wasScanned =
           submittedClients.has(client) ||
           Boolean(
@@ -819,6 +847,14 @@ export async function POST(request: Request) {
                 client
               ),
           fullHistory: data.scanScope?.fullHistory === true,
+          retentionFloor: isBackfill
+            ? undefined
+            : ownValue(
+                data.scanScope?.retentionFloors as
+                  | Record<string, string>
+                  | undefined,
+                client
+              ),
           existingLegacyDays: existingClientDays,
           incomingDays: foldParserClientSnapshot(data.contributions, client),
           state: ownValue(deviceParserStates, client),
@@ -843,6 +879,60 @@ export async function POST(request: Request) {
             `Ignored ${label} changes because this parser generation or partial snapshot cannot safely advance the device high-water.`
           );
         }
+        if (plan.highWaterDeficit) {
+          // This deficit bounds tokens only. Message growth has an independent
+          // budget and may still be credited, so do not claim all usage froze.
+          warnings.push(
+            `Added no ${label} tokens because this scan reports ${plan.highWaterDeficit.toLocaleString(
+              "en-US"
+            )} fewer tokens than this device's credited baseline. Stored history is preserved. No tokens are added until the scan exceeds that baseline; new messages may still be credited.`
+          );
+        }
+      }
+      // Admission is atomic across the shared-store family. Independent
+      // per-client guards would preserve old combined `micode` spend and add
+      // its newly labelled desktop copy on top.
+      const micodePlan = planMiCodeTransition({
+        submittedClients,
+        incomingVersions: data.scanScope?.parserVersions,
+        persistedVersions: submittedDevice.parserVersions ?? undefined,
+        fullHistory: data.scanScope?.fullHistory === true,
+        isBackfill,
+        contributions: data.contributions,
+        existingDays: existingDeviceDays,
+      });
+      if (micodePlan.mode !== "status-quo") {
+        for (const client of MICODE_FAMILY) {
+          parserPlans.set(client, micodePlan.mode === "replace"
+            ? { mode: "replace", increments: {}, layoutDays: micodePlan.layouts![client] }
+            : { mode: "freeze", increments: {} });
+        }
+        if (micodePlan.warning) warnings.push(micodePlan.warning);
+      }
+      const antigravityPlan = planAntigravityTransition({
+        submittedClients,
+        incomingVersions: data.scanScope?.parserVersions,
+        persistedVersions: submittedDevice.parserVersions ?? undefined,
+        parserStates: deviceParserStates,
+        fullHistory: data.scanScope?.fullHistory === true,
+        isBackfill,
+        contributions: data.contributions,
+        existingDays: existingDeviceDays,
+      });
+      if (antigravityPlan.mode !== "status-quo") {
+        for (const client of ANTIGRAVITY_FAMILY) {
+          parserPlans.set(
+            client,
+            antigravityPlan.mode === "replace"
+              ? {
+                  mode: "replace",
+                  increments: {},
+                  layoutDays: antigravityPlan.layouts![client],
+                }
+              : { mode: "freeze", increments: {} }
+          );
+        }
+        if (antigravityPlan.warning) warnings.push(antigravityPlan.warning);
       }
       const plannedIncrementClients = [...parserPlans].filter(
         ([, plan]) =>
@@ -851,9 +941,26 @@ export async function POST(request: Request) {
       const replaceClients = [...parserPlans]
         .filter(([, plan]) => isReplacePlan(plan))
         .map(([client]) => client);
+      // The Antigravity family replaces as one atomic unit, so its credited
+      // lifetime cost is one number, captured from the stored rows BEFORE the
+      // rewrite can delete the source that carried it. Individual per-client
+      // floors must not apply inside the family: a source move would lose the
+      // spend to a floor keyed on a client that no longer has cells, and a
+      // complete sibling carrying moved spend would double-count it.
+      const antigravityReplacing = antigravityPlan.mode === "replace";
+      const antigravityFamilyFloor = antigravityReplacing
+        ? quantizeFamilyFloor(existingDeviceDays, ANTIGRAVITY_FAMILY)
+        : 0;
+      const individuallyFlooredClients = replaceClients.filter(
+        (client) =>
+          !(
+            antigravityReplacing &&
+            (ANTIGRAVITY_FAMILY as readonly string[]).includes(client)
+          )
+      );
       const replaceCostFloors = replaceLayoutCostFloors(
         existingDeviceDays,
-        replaceClients
+        individuallyFlooredClients
       );
       const incompleteReplaceClients = new Set<string>();
 
@@ -889,6 +996,7 @@ export async function POST(request: Request) {
 
       const toUpdate: Array<{
         id: string;
+        date: string;
         tokens: number;
         cost: string;
         inputTokens: number;
@@ -903,7 +1011,11 @@ export async function POST(request: Request) {
 
       for (const incomingDay of daysToProcess.values()) {
         if (incomingDay.totals?.costIsComplete === false) {
-          for (const client of replaceClients) incompleteReplaceClients.add(client);
+          for (const client of replaceClients) {
+            if (ownValue(parserPlans.get(client)?.layoutDays ?? {}, incomingDay.date)) {
+              incompleteReplaceClients.add(client);
+            }
+          }
         }
         const incomingClientBreakdown = foldIncomingClientContributions(
           incomingDay.clients
@@ -1038,6 +1150,7 @@ export async function POST(request: Request) {
 
           toUpdate.push({
             id: existingDay.id,
+            date: incomingDay.date,
             tokens: dayTotals.tokens,
             cost: dayTotals.cost.toFixed(4),
             inputTokens: dayTotals.inputTokens,
@@ -1084,12 +1197,25 @@ export async function POST(request: Request) {
         }
       }
 
+      // Keep rounding residuals on the same dates when a new row becomes an
+      // UPDATE on replay, regardless of the incoming contribution order.
+      // ISO date strings sort chronologically without host-locale collation.
+      const mergedRows = [...toInsert, ...toUpdate].sort((a, b) =>
+        a.date < b.date ? -1 : a.date > b.date ? 1 : 0
+      );
       reapplyReplaceLayoutCostFloors(
-        [...toInsert, ...toUpdate],
+        mergedRows,
         replaceCostFloors,
         incompleteReplaceClients
       );
-      for (const row of [...toInsert, ...toUpdate]) {
+      if (antigravityReplacing && antigravityFamilyFloor > 0) {
+        reapplyReplaceFamilyCostFloor(
+          mergedRows,
+          ANTIGRAVITY_FAMILY,
+          antigravityFamilyFloor
+        );
+      }
+      for (const row of mergedRows) {
         const dayTotals = recalculateDayTotals(row.sourceBreakdown);
         row.tokens = dayTotals.tokens;
         row.cost = dayTotals.cost.toFixed(4);
@@ -1101,12 +1227,25 @@ export async function POST(request: Request) {
       const advancedParserStates = [...parserPlans].flatMap(([client, plan]) =>
         plan.nextState ? [[client, plan.nextState] as const] : []
       );
-      if (advancedParserStates.length > 0) {
+      if (
+        advancedParserStates.length > 0 ||
+        micodePlan.parserVersions ||
+        antigravityPlan.parserVersions
+      ) {
+        const parserStatesForUpdate = Object.fromEntries(
+          Object.entries(deviceParserStates).filter(
+            ([client]) =>
+              antigravityPlan.mode !== "replace" ||
+              !(ANTIGRAVITY_FAMILY as readonly string[]).includes(client)
+          )
+        );
         await tx
           .update(submittedDevices)
           .set({
             parserVersions: {
               ...(submittedDevice.parserVersions ?? {}),
+              ...micodePlan.parserVersions,
+              ...antigravityPlan.parserVersions,
               ...Object.fromEntries(
                 advancedParserStates.map(([client, state]) => [
                   client,
@@ -1115,7 +1254,7 @@ export async function POST(request: Request) {
               ),
             },
             parserStates: {
-              ...deviceParserStates,
+              ...parserStatesForUpdate,
               ...Object.fromEntries(advancedParserStates),
             },
           })
@@ -1254,6 +1393,13 @@ export async function POST(request: Request) {
         .from(dailyBreakdown)
         .where(eq(dailyBreakdown.submissionId, submissionId));
 
+      // A first submission can intentionally freeze every incoming client.
+      // With no credited days, both MIN fallbacks are NULL; keep the validated
+      // request range so the NOT NULL submission columns do not turn the
+      // actionable freeze response (and its sticky generation marker) into 500.
+      const effectiveDateStart = aggregates.dateStart ?? data.meta.dateRange.start;
+      const effectiveDateEnd = aggregates.dateEnd ?? data.meta.dateRange.end;
+
       // Session-shape totals come from the PER-DEVICE high-water marks, not
       // from SUM(daily_breakdown.active_time_ms).
       //
@@ -1332,8 +1478,8 @@ export async function POST(request: Request) {
           cacheReadTokens: totalCacheRead,
           cacheCreationTokens: totalCacheCreation,
           reasoningTokens: totalReasoning,
-          dateStart: aggregates.dateStart,
-          dateEnd: aggregates.dateEnd,
+          dateStart: effectiveDateStart,
+          dateEnd: effectiveDateEnd,
            sourcesUsed: Array.from(allClients),
            modelsUsed: Array.from(allModels),
           cliVersion: data.meta.version,
@@ -1404,8 +1550,8 @@ export async function POST(request: Request) {
           totalTokens: aggregates.totalTokens,
           totalCost: parseFloat(aggregates.totalCost),
           dateRange: {
-            start: aggregates.dateStart,
-            end: aggregates.dateEnd,
+            start: effectiveDateStart,
+            end: effectiveDateEnd,
           },
           activeDays: aggregates.activeDays,
           clients: Array.from(allClients),
