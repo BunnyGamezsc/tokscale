@@ -1017,6 +1017,37 @@ fn sandbox_config_dir(tmp: &Path) -> std::path::PathBuf {
     tmp.join(".config").join("tokscale")
 }
 
+/// Keep submit fixtures from enumerating real desktop processes. `submit` now
+/// refreshes Antigravity before scanning; HOME alone cannot contain `ps` or
+/// PowerShell discovery. The child executes only this fixture-owned shim, which
+/// reports no candidate processes on every supported platform.
+fn discovery_shim_path(tmp: &Path) -> std::ffi::OsString {
+    let bin = tmp.join(".tokscale-test-bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ps = bin.join("ps");
+        fs::write(&ps, "#!/bin/sh\nprintf 'PID PPID COMMAND\\n'\n").unwrap();
+        fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    {
+        // `Command::new("powershell")` resolves this through PATHEXT before
+        // the host PowerShell. Its JSON is the empty process collection expected
+        // by `parse_windows_process_candidates`.
+        fs::write(bin.join("powershell.cmd"), "@echo []\r\n").unwrap();
+    }
+
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
 fn cmd_with_home(tmp: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.env("HOME", tmp)
@@ -1024,6 +1055,7 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
         .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
+        .env("PATH", discovery_shim_path(tmp))
         // `pricing` intentionally bypasses TOKSCALE_PRICING_CACHE_ONLY; the
         // loopback proxies below are the offline guarantee for every command.
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
@@ -1620,7 +1652,40 @@ fn write_jcode_session(base: &Path) {
 fn write_cursor_usage_cache(base: &Path) {
     let cache_dir = base.join(".config/tokscale/cursor-cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    fs::write(cache_dir.join("usage.json"), r#"{"usageEventsDisplay":[]}"#).unwrap();
+    fs::write(
+        cache_dir.join("usage.json"),
+        r#"{"_tokscale":{"version":1,"accountId":"active-account"},"usageEventsDisplay":[]}"#,
+    )
+    .unwrap();
+}
+
+fn write_cursor_desktop_session(base: &Path) {
+    use base64::Engine;
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"auth0|user_DESKTOP"}"#);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    let relative = if cfg!(target_os = "macos") {
+        "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    } else if cfg!(target_os = "windows") {
+        "AppData/Roaming/Cursor/User/globalStorage/state.vscdb"
+    } else {
+        ".config/Cursor/User/globalStorage/state.vscdb"
+    };
+    let path = base.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["cursorAuth/accessToken", token],
+        )
+        .unwrap();
 }
 
 fn write_cursor_credentials(base: &Path) {
@@ -3123,7 +3188,7 @@ fn assert_cursor_setup_warning(json: &serde_json::Value) {
             .any(|warning| warning.as_str().is_some_and(|text| text
                 .contains("tokscale cursor login")
                 && text.contains("tokscale cursor sync --json")
-                && text.contains("cursor-cache/usage*.csv")
+                && text.contains("cursor-cache/usage*.json")
                 && text.contains("Tokscale does not parse local `~/.cursor`"))),
         "warnings did not explain Cursor setup: {warnings:?}"
     );
@@ -3221,7 +3286,7 @@ fn test_models_cursor_explicit_home_override_reports_fixture_cache_path() {
                 .contains(tmp.path().to_str().unwrap())
                 && text.contains("tokscale cursor login")
                 && text.contains("tokscale cursor sync --json")
-                && text.contains("cursor-cache/usage*.csv"))),
+                && text.contains("cursor-cache/usage*.json"))),
         "warnings did not explain Cursor --home setup: {warnings:?}"
     );
 }
@@ -3342,12 +3407,146 @@ fn test_graph_cursor_explicit_missing_cache_reports_setup_warning_text() {
 }
 
 #[test]
+fn test_cursor_desktop_session_is_imported_before_graph_and_submit_sync() {
+    for args in [
+        vec!["graph", "--client", "cursor", "--no-spinner"],
+        vec!["--no-spinner", "submit", "--client", "cursor", "--dry-run"],
+    ] {
+        let tmp = create_empty_fixture_dir();
+        write_cursor_desktop_session(tmp.path());
+        let output = cmd_with_home(tmp.path())
+            .env("APPDATA", tmp.path().join("AppData/Roaming"))
+            .env("TOKSCALE_API_TOKEN", "test-token")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let credentials: serde_json::Value = serde_json::from_slice(
+            &fs::read(tmp.path().join(".config/tokscale/cursor-credentials.json"))
+                .expect("a report must discover the signed-in desktop session without login"),
+        )
+        .unwrap();
+        assert_eq!(credentials["activeAccountId"], "user_DESKTOP");
+        assert!(
+            tmp.path()
+                .join(".config/tokscale/cursor-cache/usage.last-sync-attempt")
+                .exists(),
+            "the imported session must reach sync even though the offline proxy refuses it: {output:?}"
+        );
+
+        // A failed first implicit sync must not repeat on the very next report:
+        // the recorded attempt bounds the retry until freshness expires. An
+        // explicit `submit` keeps syncing because the user asked for it.
+        if args[0] == "graph" {
+            let marker = tmp
+                .path()
+                .join(".config/tokscale/cursor-cache/usage.last-sync-attempt");
+            let first_attempt = fs::metadata(&marker).unwrap().modified().unwrap();
+            let output = cmd_with_home(tmp.path())
+                .env("APPDATA", tmp.path().join("AppData/Roaming"))
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(
+                fs::metadata(&marker).unwrap().modified().unwrap(),
+                first_attempt,
+                "{args:?} retried the failed Cursor sync on the next report"
+            );
+        }
+    }
+}
+
+/// Logout is a durable boundary: a still-signed-in desktop session must not be
+/// re-imported by an ordinary report, and the purged cache must stay gone.
+#[test]
+fn test_cursor_logout_blocks_implicit_desktop_reimport_until_explicit_login() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_desktop_session(tmp.path());
+    let credentials = tmp.path().join(".config/tokscale/cursor-credentials.json");
+    let cache_dir = tmp.path().join(".config/tokscale/cursor-cache");
+
+    // A first report imports the desktop session, as the feature intends.
+    cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success();
+    assert!(credentials.exists());
+
+    cmd_with_home(tmp.path())
+        .args(["cursor", "logout", "--all", "--purge-cache"])
+        .assert()
+        .success();
+    assert!(!credentials.exists());
+    assert!(!cache_dir.exists());
+
+    for args in [
+        vec!["graph", "--no-spinner"],
+        vec!["graph", "--client", "cursor", "--no-spinner"],
+        vec!["--no-spinner", "submit", "--client", "cursor", "--dry-run"],
+    ] {
+        let output = cmd_with_home(tmp.path())
+            .env("APPDATA", tmp.path().join("AppData/Roaming"))
+            .env("TOKSCALE_API_TOKEN", "test-token")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            !credentials.exists(),
+            "{args:?} re-imported a desktop session after an explicit logout"
+        );
+        assert!(
+            !cache_dir.join("usage.json").exists(),
+            "{args:?} recovered purged Cursor usage after an explicit logout"
+        );
+    }
+
+    // Only an explicit Cursor command restores discovery.
+    cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["cursor", "sync", "--json", "--timeout", "1"])
+        .assert()
+        .success();
+    assert!(
+        credentials.exists(),
+        "an explicit `cursor sync` must restore desktop discovery"
+    );
+}
+
+#[test]
+fn test_cursor_desktop_session_is_not_imported_for_excluded_or_external_reports() {
+    for external in [false, true] {
+        let tmp = create_empty_fixture_dir();
+        write_cursor_desktop_session(tmp.path());
+        let mut cmd = cmd_with_home(tmp.path());
+        cmd.env("APPDATA", tmp.path().join("AppData/Roaming"));
+        cmd.args(["graph", "--no-spinner", "--client"]);
+        if external {
+            cmd.arg("cursor").arg("--home").arg(tmp.path());
+        } else {
+            cmd.arg("opencode");
+        }
+        cmd.assert().success();
+        assert!(!tmp
+            .path()
+            .join(".config/tokscale/cursor-credentials.json")
+            .exists());
+    }
+}
+
+#[test]
 fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
     let tmp = create_empty_fixture_dir();
+    write_cursor_desktop_session(tmp.path());
     write_cursor_credentials(tmp.path());
     write_cursor_usage_cache(tmp.path());
 
+    let credentials = tmp.path().join(".config/tokscale/cursor-credentials.json");
+    let saved_credentials = fs::read(&credentials).unwrap();
     let output = cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
@@ -3365,6 +3564,66 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
         !stderr.contains("Cursor sync failed") && !stderr.contains("Cursor sync warning"),
         "fresh Cursor cache should skip implicit graph sync; stderr: {stderr}"
     );
+    assert_eq!(
+        fs::read(credentials).unwrap(),
+        saved_credentials,
+        "a fresh report must retain its saved login even when the desktop account differs"
+    );
+}
+
+#[test]
+fn test_cursor_logout_all_purge_removes_cache_without_credentials() {
+    let tmp = create_empty_fixture_dir();
+    let current = tmp.path().join(".config/tokscale/cursor-cache");
+    let legacy = tmp.path().join(".tokscale/cursor-cache");
+    fs::create_dir_all(current.join("archive/old")).unwrap();
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(current.join("archive/old/usage.json"), b"archived usage").unwrap();
+    fs::write(legacy.join("usage.csv"), b"legacy usage").unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .args(["cursor", "logout", "--all", "--purge-cache"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!current.exists());
+    assert!(!legacy.exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Purged all Cursor cache data"));
+}
+
+#[test]
+fn test_graph_preserves_unowned_cursor_cache_when_refetch_fails() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_credentials(tmp.path());
+    let cache_dir = tmp.path().join(".config/tokscale/cursor-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let legacy = r#"{"usageEventsDisplay":[]}"#;
+    fs::write(cache_dir.join("usage.json"), legacy).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("preserved 1 cache file(s)"), "{stderr}");
+    assert!(stderr.contains("Cursor sync failed"), "{stderr}");
+    assert!(!cache_dir.join("usage.json").exists());
+    let archives: Vec<_> = fs::read_dir(cache_dir.join("archive")).unwrap().collect();
+    assert_eq!(archives.len(), 1);
+    let original = archives[0].as_ref().unwrap().path().join("usage.json");
+    assert_eq!(fs::read_to_string(original).unwrap(), legacy);
 }
 
 #[test]
@@ -3480,6 +3739,7 @@ fn test_submit_tip_recommends_only_the_client_filter() {
         .stdout(predicate::str::contains(
             "Tip: narrow the scan with `--client <id>` for a faster submit.",
         ))
+        .stdout(predicate::str::contains("Syncing Antigravity usage data...").not())
         .stdout(predicate::str::is_match(r"Tip:.*--since").unwrap().not());
 }
 
@@ -3613,6 +3873,14 @@ fn test_models_json_output() {
         .unwrap();
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(
+        json["undatedTokens"],
+        serde_json::json!({
+            "input":0, "output":0, "cacheRead":0, "cacheWrite":0,
+            "cacheWrite1h":0, "reasoning":0,
+        })
+    );
 
     assert!(json.get("groupBy").is_some(), "Missing groupBy field");
     assert!(json.get("entries").is_some(), "Missing entries field");
@@ -4050,6 +4318,145 @@ fn test_monthly_json_output() {
     assert!(first.get("reasoning").is_some());
     assert!(first.get("messageCount").is_some());
     assert!(first.get("cost").is_some());
+}
+
+#[test]
+fn missing_codex_usage_cli_warns_without_changing_json_or_recorded_totals() {
+    let tmp = TempDir::new().unwrap();
+    prime_pricing_cache(tmp.path());
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("rollout.jsonl");
+    let activity = concat!(
+        r#"{"timestamp":"2020-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+        "\n"
+    );
+    fs::write(&path, activity).unwrap();
+    let report = || {
+        cmd_with_home(tmp.path())
+            .args([
+                "monthly",
+                "--json",
+                "--no-spinner",
+                "--client",
+                "codex",
+                "--home",
+                tmp.path().to_str().unwrap(),
+                "--since",
+                "2026-05-01",
+                "--until",
+                "2026-05-31",
+            ])
+            .output()
+            .unwrap()
+    };
+    // The source warning covers inspected files even outside the report dates,
+    // and must survive the next process reading an unchanged source cache.
+    for _ in 0..2 {
+        let output = report();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["entries"], serde_json::json!([]));
+        assert_eq!(json["totalCost"], 0.0);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr
+                .matches("contain Codex activity but no supported usage records")
+                .count(),
+            1
+        );
+        assert!(stderr.contains("1 of 1 inspected rollout files"));
+        assert!(stderr.contains("independently of the selected report dates"));
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    use std::io::Write;
+    file.write_all(concat!(
+        r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-30T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":20,"cached_input_tokens":10}}}}"#,
+        "\n"
+    ).as_bytes()).unwrap();
+    file.flush().unwrap();
+    drop(file);
+    for _ in 0..2 {
+        let output = report();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("source-completeness diagnostic"));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["entries"][0]["input"], 90);
+        assert_eq!(json["entries"][0]["output"], 20);
+        assert_eq!(json["entries"][0]["cacheRead"], 10);
+    }
+}
+
+#[test]
+fn missing_codex_usage_cli_excludes_zero_malformed_and_openclaw_sources() {
+    let activity = concat!(
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#,
+        "\n"
+    );
+    for content in [
+        String::new(),
+        r#"{"type":"session_meta","payload":{"id":"metadata-only"}}"#.to_string(),
+        format!("{activity}not json\n"),
+        format!(
+            "{activity}{}\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}"#
+        ),
+        format!(
+            "{}\n{activity}",
+            r#"{"type":"session_meta","payload":{"originator":"openclaw"}}"#
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        prime_pricing_cache(tmp.path());
+        let sessions = tmp.path().join(".codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("rollout.jsonl"), content).unwrap();
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "monthly",
+                "--json",
+                "--no-spinner",
+                "--client",
+                "codex",
+                "--home",
+                tmp.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["entries"], serde_json::json!([]));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("source-completeness diagnostic"));
+    }
+}
+
+#[test]
+fn missing_codex_usage_task_report_warns_and_excludes_injected_context() {
+    let activity = concat!(
+        r#"{"type":"response_item","payload":{"type":"web_search_call"}}"#,
+        "\n"
+    );
+    for (content, expected) in [
+        (activity.to_string(), true),
+        (format!("{activity}{}\n", r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"output_tokens":0}}}}"#), false),
+        (concat!(r#"{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context>cwd=/tmp</environment_context>"}}"#, "\n").to_string(), false),
+    ] {
+        let tmp = create_empty_fixture_dir();
+        let sessions = tmp.path().join(".codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("rollout.jsonl"), content).unwrap();
+        for _ in 0..2 {
+            let output = cmd_with_home(tmp.path())
+                .args(["report", "--no-summarize", "--json"])
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report, serde_json::json!([]));
+            assert_eq!(String::from_utf8_lossy(&output.stderr).contains("source-completeness diagnostic"), expected);
+        }
+    }
 }
 
 #[test]
@@ -5059,7 +5466,7 @@ fn test_clients_json_includes_claude_desktop_diagnostic() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["severity"] == "warning"
             && item["message"]
                 .as_str()
@@ -5193,8 +5600,8 @@ fn test_clients_home_override_ignores_conflicting_claude_config_dir_env() {
     let diagnostics = claude["diagnostics"].as_array().unwrap();
     let desktop_diagnostic = diagnostics
         .iter()
-        .find(|item| item["code"] == "claude_desktop_not_scanned")
-        .expect("claude_desktop_not_scanned diagnostic should be present");
+        .find(|item| item["code"] == "claude_desktop_partial_history")
+        .expect("claude_desktop_partial_history diagnostic should be present");
     let paths = desktop_diagnostic["paths"].as_array().unwrap();
 
     for label in ["claudeCodeProjects", "claudeCodeTranscripts"] {
@@ -5228,7 +5635,7 @@ fn test_clients_command_includes_claude_desktop_diagnostic_text() {
             "Claude Desktop app data was detected",
         ))
         .stdout(predicate::str::contains(
-            "Claude Code JSONL transcripts only",
+            "Local transcripts and available conversation-cache counters",
         ));
 }
 
@@ -5247,11 +5654,11 @@ fn test_models_json_includes_claude_desktop_diagnostic_for_empty_explicit_claude
     let diagnostics = json["diagnostics"].as_array().unwrap();
 
     assert!(diagnostics.iter().any(|item| {
-        item["code"] == "claude_desktop_not_scanned"
+        item["code"] == "claude_desktop_partial_history"
             && item["message"]
                 .as_str()
                 .unwrap()
-                .contains("Tokscale counts Claude Code JSONL transcripts")
+                .contains("Local transcripts and available conversation-cache counters")
     }));
 }
 
@@ -5693,7 +6100,7 @@ fn test_submit_includes_unpriced_usage_at_zero_and_keeps_the_rest() {
         "the hint must name the custom pricing file: {stdout}"
     );
     assert!(
-        stdout.contains("keyed by the model id alone"),
+        stdout.contains("using global `models` or scoped `provider_overrides`"),
         "the hint must state the key format, since the warning above prints provider/model but CustomPricing::lookup keys on the model id: {stdout}"
     );
     assert!(
@@ -7068,5 +7475,527 @@ fn test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open() {
         fs::read_to_string(&legacy).unwrap(),
         r#"{"colorPalette":"green"}"#,
         "and the legacy file itself must be left alone"
+    );
+}
+
+#[test]
+fn test_codex_compressed_session_reports_usage() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    let compressed_file = sessions.join("fixture.jsonl.zst");
+    fs::write(
+        &compressed_file,
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    // Check a cold archive scan, an uncompressed duplicate, and the warm cache.
+    for scan in 0..3 {
+        if scan == 1 {
+            fs::write(sessions.join("fixture.jsonl"), content).unwrap();
+        }
+        let output = cmd_with_home(tmp.path())
+            .args(["--client", "codex", "--json", "--no-spinner"])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalInput"].as_i64().unwrap(), 110);
+        assert_eq!(json["totalCacheRead"].as_i64().unwrap(), 30);
+        assert_eq!(json["totalOutput"].as_i64().unwrap(), 10);
+        assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+        assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+    }
+}
+
+#[test]
+fn billing_custom_cli_is_offline_and_keeps_old_source_flag() {
+    let tmp = TempDir::new().unwrap();
+    let config = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("custom-pricing.json"),r#"{"models":{"atlas":{"input_cost_per_million_tokens":9}},"provider_overrides":[{"provider_id":" Vertex ","model_id":"atlas","pricing":{"input_cost_per_million_tokens":2}}]}"#).unwrap();
+    for source_flag in ["--source", "--provider"] {
+        let output = cmd_with_home(tmp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "pricing",
+                "atlas",
+                source_flag,
+                "custom",
+                "--billing-provider",
+                "vertex",
+                "--json",
+                "--no-spinner",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["scope"], "provider");
+        assert_eq!(value["matchedProviderId"], "vertex");
+        assert_eq!(value["pricing"]["inputCostPerToken"], 0.000002);
+        assert_eq!(value["missingRates"], serde_json::json!(["output"]));
+    }
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "atlas",
+            "--provider",
+            "custom",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["scope"], "global");
+    cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .success();
+    let output = cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides", "--json", "--no-spinner"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["count"], 2);
+    assert_eq!(value["models"][0]["scope"], "global");
+    assert_eq!(value["models"][1]["providerId"], "vertex");
+}
+
+#[test]
+fn billing_label_does_not_change_catalog_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let model = "claude-sonnet-4-20250514";
+    prime_canonical_sonnet_pricing_cache(tmp.path(), model);
+    for source in [
+        None,
+        Some("litellm"),
+        Some("openrouter"),
+        Some("models.dev"),
+    ] {
+        let lookup = |billing: Option<&str>| {
+            let mut command = cmd_with_home(tmp.path());
+            command.args(["pricing", model, "--json", "--no-spinner"]);
+            if let Some(source) = source {
+                command.args(["--source", source]);
+            }
+            if let Some(billing) = billing {
+                command.args(["--billing-provider", billing]);
+            }
+            let output = command
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap()
+        };
+        let baseline = lookup(None);
+        assert_eq!(baseline["scope"], "upstream");
+        for billing in ["unpriced:anything", "azure", "vertex"] {
+            let mut actual = lookup(Some(billing));
+            assert_eq!(actual["billingProviderId"], billing);
+            actual["billingProviderId"] = serde_json::Value::Null;
+            assert_eq!(actual, baseline, "source={source:?}, billing={billing}");
+        }
+    }
+}
+
+#[test]
+fn billing_strict_validation_rejects_invalid_and_unreadable_configuration() {
+    let tmp = TempDir::new().unwrap();
+    let config = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config).unwrap();
+    let file = config.join("custom-pricing.json");
+    fs::write(&file,r#"{"provider_overrides":[{"provider_id":"unknown","model_id":"atlas","pricing":{"input_cost_per_token":1}}]}"#).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["valid"], false);
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["diagnostics"][0]["code"], "io_error");
+}
+
+fn create_billing_explain_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    prime_pricing_cache(tmp.path());
+    let session = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/billing");
+    fs::create_dir_all(&session).unwrap();
+    for (index, provider) in [Some("vertex"), Some("openrouter/google"), None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut message = serde_json::json!({
+            "id": format!("billing-{index}"),
+            "sessionID": "billing",
+            "role": "assistant",
+            "modelID": "private-model",
+            "tokens": {"input": 1, "output": 0, "cache": {"read": 0, "write": 0}},
+            "time": {"created": 1780000000000u64 + index as u64},
+        });
+        if let Some(provider) = provider {
+            message["providerID"] = serde_json::json!(provider);
+        }
+        fs::write(
+            session.join(format!("billing-{index}.json")),
+            message.to_string(),
+        )
+        .unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn billing_explain_rejects_unknown_and_blank_filters() {
+    let tmp = create_billing_explain_fixture();
+    for provider in ["unknown", " UnKnOwN ", "", " \t\n "] {
+        let output = cmd_with_home(tmp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "pricing",
+                "explain",
+                "--billing-provider",
+                provider,
+                "--json",
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid filter {provider:?} was accepted"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "invalid filter exposed local pricing rows"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--billing-provider"));
+    }
+}
+
+#[test]
+fn billing_explain_known_filter_is_exact_and_normalized() {
+    let tmp = create_billing_explain_fixture();
+    let output = cmd_with_home(tmp.path())
+        .timeout(Duration::from_secs(10))
+        .args(["pricing", "explain", "--json", "--no-spinner"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "fixture must contain two known channels and one unknown"
+    );
+
+    for (provider, expected) in [
+        (" VERTEX ", Some("vertex")),
+        (" OpenRouter/Google ", Some("openrouter/google")),
+        ("google", None),
+        ("no-such-channel", None),
+    ] {
+        let output = cmd_with_home(tmp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "pricing",
+                "explain",
+                "--billing-provider",
+                provider,
+                "--json",
+                "--no-spinner",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output).unwrap();
+        assert_eq!(rows.len(), usize::from(expected.is_some()), "{provider:?}");
+        if let Some(expected) = expected {
+            assert_eq!(rows[0]["billingProviderId"], expected);
+        }
+    }
+}
+
+#[test]
+fn test_codex_compressed_session_respects_max_decoded_bytes_env() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    let compressed_file = sessions.join("fixture.jsonl.zst");
+    fs::write(
+        &compressed_file,
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    let capped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        capped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&capped_output.stderr)
+    );
+    let capped_stderr = String::from_utf8_lossy(&capped_output.stderr);
+    assert!(
+        capped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {capped_stderr}"
+    );
+    assert!(
+        capped_stderr.contains("decoded size limit exceeded: more than 64 bytes"),
+        "stderr: {capped_stderr}"
+    );
+    let capped_json: serde_json::Value = serde_json::from_slice(&capped_output.stdout).unwrap();
+    assert_eq!(capped_json["totalMessages"].as_i64().unwrap(), 0);
+
+    // Raising the decoded limit recovers the previously skipped archive because
+    // failed archive parses are never cached.
+    let raised_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "4096")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        raised_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&raised_output.stderr)
+    );
+    let raised_stderr = String::from_utf8_lossy(&raised_output.stderr);
+    assert!(
+        !raised_stderr.contains("unreadable compressed Codex rollout"),
+        "stderr: {raised_stderr}"
+    );
+    let raised_json: serde_json::Value = serde_json::from_slice(&raised_output.stdout).unwrap();
+    assert_eq!(raised_json["totalInput"].as_i64().unwrap(), 110);
+    assert_eq!(raised_json["totalCacheRead"].as_i64().unwrap(), 30);
+    assert_eq!(raised_json["totalOutput"].as_i64().unwrap(), 10);
+    assert_eq!(raised_json["totalMessages"].as_i64().unwrap(), 1);
+    assert_eq!(raised_json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
+
+    // Lowering the limit on the populated cache must invalidate the entry and reparse,
+    // skipping the archive rather than serving the cached entry.
+    let recapped_output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "64")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        recapped_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&recapped_output.stderr)
+    );
+    let recapped_stderr = String::from_utf8_lossy(&recapped_output.stderr);
+    assert!(
+        recapped_stderr.contains("1 exceeded the 64-byte decoded-size limit"),
+        "stderr: {recapped_stderr}"
+    );
+    let recapped_json: serde_json::Value = serde_json::from_slice(&recapped_output.stdout).unwrap();
+    assert_eq!(recapped_json["totalMessages"].as_i64().unwrap(), 0);
+}
+
+#[test]
+fn test_codex_archive_limit_cache_identity_uses_exact_ceiling() {
+    use std::io::Write as _;
+
+    // These two accepted ceilings collide under the former 32-bit FNV cache
+    // version. Keep the decoded fixture between them so a warm hit admitted by
+    // the higher ceiling must be rejected after switching to the lower one.
+    const LOWER_LIMIT: u64 = 61_378_655;
+    const HIGHER_LIMIT: u64 = 71_067_507;
+    const PADDING_RECORDS: usize = 62;
+
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let compressed_file = sessions.join("collision-fixture.jsonl.zst");
+    let turn_context =
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#;
+    let padding_record = format!(
+        r#"{{"timestamp":"2026-10-01T00:00:01Z","type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+        "x".repeat(1_000_000)
+    );
+    let usage = r#"{"timestamp":"2026-10-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#;
+    let decoded_size =
+        turn_context.len() + 1 + PADDING_RECORDS * (padding_record.len() + 1) + usage.len() + 1;
+    assert!((decoded_size as u64) > LOWER_LIMIT);
+    assert!((decoded_size as u64) < HIGHER_LIMIT);
+
+    let mut encoder =
+        zstd::stream::write::Encoder::new(fs::File::create(&compressed_file).unwrap(), 0).unwrap();
+    writeln!(encoder, "{turn_context}").unwrap();
+    for _ in 0..PADDING_RECORDS {
+        writeln!(encoder, "{padding_record}").unwrap();
+    }
+    writeln!(encoder, "{usage}").unwrap();
+    encoder.finish().unwrap();
+
+    let admitted = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", HIGHER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        admitted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    let admitted_json: serde_json::Value = serde_json::from_slice(&admitted.stdout).unwrap();
+    assert_eq!(admitted_json["totalMessages"].as_i64().unwrap(), 1);
+
+    let rejected = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", LOWER_LIMIT.to_string())
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        rejected.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejected_stderr.contains("1 exceeded the 61378655-byte decoded-size limit"),
+        "stderr: {rejected_stderr}"
+    );
+    let rejected_json: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected_json["totalMessages"].as_i64().unwrap(), 0);
+}
+
+#[test]
+fn test_codex_invalid_max_decoded_bytes_env_warns_and_uses_default() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    let content = concat!(
+        r#"{"timestamp":"2026-10-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160},"last_token_usage":{"input_tokens":140,"cached_input_tokens":30,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":160}}}}"#,
+        "\n"
+    );
+    fs::write(
+        sessions.join("fixture.jsonl.zst"),
+        zstd::encode_all(content.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+
+    // "512MiB" looks like a limit a user would write, but it does not parse, so
+    // the ceiling silently stays at the 1 GiB default.
+    let output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "512MiB")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("TOKSCALE_CODEX_MAX_DECODED_BYTES=\"512MiB\" is not a whole number of bytes"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("using the default 1073741824-byte decoded-size limit"),
+        "stderr: {stderr}"
+    );
+    // The limit is read once per scanned archive and again per cache-identity
+    // check, so a per-call warning would repeat. `contains` alone passes either
+    // way, which is what makes the count the assertion that matters.
+    assert_eq!(
+        stderr.matches("TOKSCALE_CODEX_MAX_DECODED_BYTES=").count(),
+        1,
+        "the invalid-setting warning must be emitted once per process; stderr: {stderr}"
+    );
+    // The archive is well under the default, so the invalid value must not cost
+    // the user their usage.
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+    assert_eq!(json["totalInput"].as_i64().unwrap(), 110);
+
+    // A valid value stays silent.
+    let valid = cmd_with_home(tmp.path())
+        .env("TOKSCALE_CODEX_MAX_DECODED_BYTES", "4096")
+        .args(["--client", "codex", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(valid.status.success());
+    let valid_stderr = String::from_utf8_lossy(&valid.stderr);
+    assert!(
+        !valid_stderr.contains("is not a whole number of bytes"),
+        "stderr: {valid_stderr}"
     );
 }

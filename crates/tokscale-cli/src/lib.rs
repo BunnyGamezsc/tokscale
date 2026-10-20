@@ -14,6 +14,7 @@ pub use shared::{
     ClientFlags, DateRangeFlags,
 };
 
+pub mod amp;
 pub mod antigravity;
 pub mod auth;
 pub mod claude_diagnostics;
@@ -26,4 +27,5 @@ pub mod process_liveness;
 pub mod spawn;
 pub mod trae;
 pub mod tui;
+pub mod ui_glyphs;
 pub mod warp;

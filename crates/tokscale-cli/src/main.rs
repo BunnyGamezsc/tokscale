@@ -475,10 +475,17 @@ enum CursorSubcommand {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
-    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.csv")]
+    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.json")]
     Sync {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS),
+            help = "Overall sync timeout in seconds, 1-86400 (overrides cursor.syncTimeoutSeconds in settings.json and the default dynamic budget)"
+        )]
+        timeout: Option<u64>,
     },
     #[command(about = "Switch active Cursor account")]
     Switch {
@@ -4478,7 +4485,7 @@ struct TsTokenContributionData {
 }
 
 fn to_ts_token_contribution_data(
-    graph: &tokscale_core::GraphResult,
+    graph: &tokscale_core::GraphResultV2,
     device: Option<&device::SubmitDevice>,
     scan_scope: Option<TsScanScope>,
 ) -> TsTokenContributionData {
@@ -5053,7 +5060,7 @@ fn run_graph_command(
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
-    use tokscale_core::{generate_local_graph_report, GroupBy};
+    use tokscale_core::{generate_local_graph_report_v2, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
     let mut context = LocalReportContext::new(home_dir, clients, date, None);
@@ -5069,7 +5076,7 @@ fn run_graph_command(
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(context.report_options(GroupBy::default())).await
+            generate_local_graph_report_v2(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
@@ -5480,10 +5487,10 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
 /// the local recovery overlay reconstructs, which submission never sends and
 /// which therefore must not count as coverage.
 fn drop_locally_scanned_usage(
-    graph: &mut tokscale_core::GraphResult,
+    graph: &mut tokscale_core::GraphResultV2,
     imported_clients: &[String],
 ) -> Result<Vec<(String, String)>> {
-    use tokscale_core::{generate_source_graph_report, GroupBy, ReportOptions};
+    use tokscale_core::{generate_source_graph_report_v2, GroupBy, ReportOptions};
 
     // This scan only feeds overlap detection, which reads (date, client)
     // identities and non-zero token flags — never costs — so the lenient local
@@ -5491,14 +5498,14 @@ fn drop_locally_scanned_usage(
     // must not abort the whole import over a scan whose costs nobody reads.
     // The imported costs come from the export itself.
     //
-    // Source-only, not `generate_local_graph_report`: the question here is
+    // Source-only, not `generate_local_graph_report_v2`: the question here is
     // "does `tokscale submit` already report this row?", and submission reads
     // source messages alone. The local recovery overlay is never submitted, so
     // counting it as coverage would drop an imported row that nothing else ever
     // uploads (#1364).
     let rt = tokio::runtime::Runtime::new()?;
     let local = rt
-        .block_on(generate_source_graph_report(ReportOptions {
+        .block_on(generate_source_graph_report_v2(ReportOptions {
             home_dir: None,
             use_env_roots: true,
             clients: Some(imported_clients.to_vec()),
@@ -5514,8 +5521,8 @@ fn drop_locally_scanned_usage(
 }
 
 fn drop_overlapping_rows(
-    graph: &mut tokscale_core::GraphResult,
-    local: &tokscale_core::GraphResult,
+    graph: &mut tokscale_core::GraphResultV2,
+    local: &tokscale_core::GraphResultV2,
 ) -> Vec<(String, String)> {
     let scanned: std::collections::HashSet<(&str, &str)> = local
         .contributions
@@ -5565,11 +5572,11 @@ fn drop_overlapping_rows(
 /// rollups, and the meta date range from what remains. Shared by
 /// [`drop_overlapping_rows`] and the tokenless-cost exclusion path in
 /// `run_import_command`, where exclusion can empty every client of a day.
-fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResult) {
+fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResultV2) {
     graph.contributions.retain(|day| !day.clients.is_empty());
-    tokscale_core::calculate_intensities(&mut graph.contributions);
-    graph.summary = tokscale_core::calculate_summary(&graph.contributions);
-    graph.years = tokscale_core::calculate_years(&graph.contributions);
+    tokscale_core::calculate_intensities_v2(&mut graph.contributions);
+    graph.summary = tokscale_core::calculate_summary_v2(&graph.contributions);
+    graph.years = tokscale_core::calculate_years_v2(&graph.contributions);
     if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last()) {
         graph.meta.date_range_start = first.date.clone();
         graph.meta.date_range_end = last.date.clone();
@@ -5579,7 +5586,7 @@ fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResult) {
 /// The submit payload for an imported graph. MCP names stay the local ones, as
 /// `submit` sends them: the server stores the latest list per profile, and an
 /// empty one would clear it.
-fn backfill_payload(graph: &tokscale_core::GraphResult, importer: &str) -> TsTokenContributionData {
+fn backfill_payload(graph: &tokscale_core::GraphResultV2, importer: &str) -> TsTokenContributionData {
     let mut payload = to_ts_token_contribution_data(graph, None, None);
     payload.provenance = Some(TsSubmissionProvenance {
         origin: "backfill",
@@ -5635,13 +5642,13 @@ fn client_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
 /// drop them either — otherwise that legitimate cost silently disappears from
 /// the submission. Keep in sync with `CURSOR_LEGACY_TOKENLESS_MODELS` in
 /// packages/frontend/src/lib/validation/submission.ts.
-fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "cursor"
         && client.model_id == "premium-tool-call"
         && client_token_total(&client.tokens) == 0
 }
 
-fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "warp"
         && client.model_id == "aggregate-requests"
         && client_token_total(&client.tokens) == 0
@@ -5650,7 +5657,7 @@ fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> boo
 /// A row the server's "Cost submitted without tokens" sanity check would
 /// reject: real cost with every token bucket at zero, excluding the Cursor
 /// `premium-tool-call` carve-out above.
-fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_tokenless_costed_row(client: &tokscale_core::ClientContributionV2) -> bool {
     (is_aggregate_only_warp_row(client) || client.cost > 0.0)
         && client_token_total(&client.tokens) == 0
         && !is_legacy_tokenless_cursor_row(client)
@@ -5670,7 +5677,7 @@ fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
 /// totals, breakdowns, and intensities are untouched. Summary and year rollups
 /// are recomputed from the trimmed contributions.
 fn exclude_tokenless_cost_contributions(
-    graph_result: &mut tokscale_core::GraphResult,
+    graph_result: &mut tokscale_core::GraphResultV2,
 ) -> Vec<ExcludedTokenlessRow> {
     let mut excluded: Vec<ExcludedTokenlessRow> = Vec::new();
 
@@ -5703,8 +5710,8 @@ fn exclude_tokenless_cost_contributions(
     }
 
     if !excluded.is_empty() {
-        graph_result.summary = tokscale_core::calculate_summary(&graph_result.contributions);
-        graph_result.years = tokscale_core::calculate_years(&graph_result.contributions);
+        graph_result.summary = tokscale_core::calculate_summary_v2(&graph_result.contributions);
+        graph_result.years = tokscale_core::calculate_years_v2(&graph_result.contributions);
     }
 
     excluded
@@ -5931,7 +5938,7 @@ fn run_submit_command(
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
-    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+    use tokscale_core::{generate_submission_graph_v2, GroupBy, ReportOptions};
 
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
@@ -6048,7 +6055,7 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph(ReportOptions {
+            generate_submission_graph_v2(ReportOptions {
                 home_dir: None,
                 use_env_roots: true,
                 clients,
@@ -6457,7 +6464,7 @@ fn run_cursor_command(subcommand: CursorSubcommand) -> Result<()> {
         } => cursor::run_cursor_logout(name, all, purge_cache),
         CursorSubcommand::Status { name } => cursor::run_cursor_status(name),
         CursorSubcommand::Accounts { json } => cursor::run_cursor_accounts(json),
-        CursorSubcommand::Sync { json } => cursor::run_cursor_sync(json),
+        CursorSubcommand::Sync { json, timeout } => cursor::run_cursor_sync(json, timeout),
         CursorSubcommand::Switch { name } => cursor::run_cursor_switch(&name),
     }
 }

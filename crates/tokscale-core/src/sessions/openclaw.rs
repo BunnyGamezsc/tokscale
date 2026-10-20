@@ -34,13 +34,13 @@
 //! record of that turn when it has one.
 
 use super::utils::{
-    file_modified_timestamp_ms, for_each_json_line, lossy_lines, open_readonly_sqlite,
+    file_modified_timestamp_ms, for_each_archive_line, for_each_json_line, open_readonly_sqlite,
     parse_json_line, read_file_or_none, sqlite_for_each_row_on, timestamp_secs_to_ms, CamelUsage,
+    MAX_ARCHIVE_BYTES,
 };
 use super::UnifiedMessage;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -184,40 +184,18 @@ pub(crate) fn classify_openclaw_jsonl(path: &Path) -> OpenClawJsonlKind {
 /// checkpoint or recovery can hold an exclusive lock for a moment.
 const OPENCLAW_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(1500);
 
-// Archived transcripts are immutable zstd files. Bound expansion before parsing
-// so a corrupt archive cannot allocate its advertised decoded size.
-const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
-
-fn read_archive(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(file)?;
-    decoder.window_log_max(26)?;
-    let mut bytes = Vec::new();
-    decoder.take(max_bytes + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(std::io::Error::other(
-            "decoded transcript exceeds archive limit",
-        ));
-    }
-    Ok(bytes)
-}
-
-fn for_each_transcript_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) {
+fn for_each_transcript_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) -> bool {
     if path.extension().is_none_or(|extension| extension != "zst") {
         for_each_json_line(path, sink);
-        return;
+        return true;
     }
 
-    match read_archive(path, MAX_ARCHIVE_BYTES) {
-        Ok(bytes) => {
-            for (index, line) in lossy_lines(bytes.as_slice()).enumerate() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    sink(index, trimmed);
-                }
-            }
+    match for_each_archive_line(path, MAX_ARCHIVE_BYTES, sink) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "Skipping OpenClaw archive");
+            false
         }
-        Err(error) => tracing::warn!(path = %path.display(), %error, "Skipping OpenClaw archive"),
     }
 }
 
@@ -387,20 +365,42 @@ fn ingest_openclaw_entry(
                 .map(|turn| (turn.thread.to_string(), turn.turn.map(str::to_string)));
             let usage = msg.usage?;
 
-            let model = msg
-                .model
-                .and_then(non_empty)
+            let message_model = msg.model.and_then(non_empty);
+            let model = message_model
+                .clone()
                 .or_else(|| state.current_model.clone().and_then(non_empty))
                 .or_else(|| ctx.session_model.map(str::to_string).and_then(non_empty))?;
-            let provider = msg
-                .provider
-                .and_then(non_empty)
-                .or_else(|| state.current_provider.clone().and_then(non_empty))
+            let message_provider = msg.provider.and_then(non_empty);
+            let observed_provider = message_provider
+                .clone()
+                .or_else(|| state.current_provider.clone().and_then(non_empty));
+            let provider = observed_provider
+                .clone()
                 .or_else(|| ctx.session_provider.map(str::to_string).and_then(non_empty))
                 .unwrap_or_else(|| "unknown".to_string());
+            let billing_identity = if let Some(provider) = message_provider.as_deref() {
+                super::BillingIdentity::from_explicit(
+                    Some(provider),
+                    super::BillingIdentityOrigin::ExplicitRecord,
+                )
+            } else if let Some(provider) = observed_provider.as_deref() {
+                super::BillingIdentity::from_explicit(
+                    Some(provider),
+                    super::BillingIdentityOrigin::ExplicitSession,
+                )
+            } else {
+                // `session_windows` stores only the session's current route. It
+                // is useful attribution fallback, but cannot establish which
+                // route an older transcript event was billed through.
+                super::BillingIdentity::Unknown
+            };
 
-            state.current_model = Some(model.clone());
-            state.current_provider = Some(provider.clone());
+            if let Some(model) = message_model {
+                state.current_model = Some(model);
+            }
+            if let Some(provider) = message_provider {
+                state.current_provider = Some(provider);
+            }
             let timestamp = msg.timestamp.unwrap_or(ctx.fallback_timestamp);
             let cost = usage.cost.as_ref().and_then(|c| c.total).unwrap_or(0.0);
             let tokens = usage.to_breakdown_with_reasoning();
@@ -416,7 +416,7 @@ fn ingest_openclaw_entry(
                 )
             });
 
-            Some(UnifiedMessage::new_with_dedup(
+            let mut message = UnifiedMessage::new_with_dedup(
                 "openclaw",
                 model,
                 provider,
@@ -425,7 +425,9 @@ fn ingest_openclaw_entry(
                 tokens,
                 cost.max(0.0),
                 dedup_key,
-            ))
+            );
+            message.billing_identity = billing_identity;
+            Some(message)
         }
         _ => None,
     }
@@ -532,7 +534,7 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
     let mut state = OpenClawSessionState::default();
     let mut buffer = Vec::with_capacity(4096);
 
-    for_each_transcript_line(session_path, &mut |_index, trimmed| {
+    let ok = for_each_transcript_line(session_path, &mut |_index, trimmed| {
         let Some(entry) = parse_json_line::<OpenClawEntry>(trimmed, &mut buffer) else {
             return;
         };
@@ -540,6 +542,10 @@ fn parse_openclaw_session(session_path: &Path, session_id: &str) -> Vec<UnifiedM
             messages.push(message);
         }
     });
+
+    if !ok {
+        return Vec::new();
+    }
 
     messages
 }
@@ -1000,9 +1006,11 @@ mod tests {
     fn compressed_archive_enforces_decoded_limit() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("session.jsonl.zst");
-        std::fs::write(&path, zstd::encode_all(&b"12345"[..], 0).unwrap()).unwrap();
-        assert_eq!(read_archive(&path, 5).unwrap(), b"12345");
-        assert!(read_archive(&path, 4).is_err());
+        std::fs::write(&path, zstd::encode_all(&b"12345\n"[..], 0).unwrap()).unwrap();
+        let mut lines = Vec::new();
+        assert!(for_each_archive_line(&path, 6, |_idx, line| lines.push(line.to_string())).is_ok());
+        assert_eq!(lines, vec!["12345"]);
+        assert!(for_each_archive_line(&path, 4, |_idx, _line| ()).is_err());
     }
 
     #[test]
@@ -1832,6 +1840,27 @@ mod tests {
                     "message-provider",
                     "message-model"
                 ),
+            ]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.billing_identity.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::sessions::BillingIdentity::Unknown,
+                crate::sessions::BillingIdentity::Known {
+                    id: "event-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+                },
+                crate::sessions::BillingIdentity::Known {
+                    id: "message-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+                },
+                crate::sessions::BillingIdentity::Known {
+                    id: "message-provider".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+                },
             ]
         );
     }
