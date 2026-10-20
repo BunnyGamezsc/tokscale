@@ -123,6 +123,13 @@ fn cursor_cache_dir(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/tokscale/cursor-cache")
 }
 
+/// FORK NOTE: where Sync's status looks for Cursor's cache files. Upstream
+/// folded this into the per-account sync path, but tokscale-gui reports the
+/// cache's mtime without starting a sync.
+pub fn get_cursor_cache_dir() -> Result<PathBuf> {
+    Ok(cursor_cache_dir(&home_dir()?))
+}
+
 fn cursor_desktop_auto_import_disabled_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/tokscale/cursor-desktop-auto-import.disabled")
 }
